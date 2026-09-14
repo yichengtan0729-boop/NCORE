@@ -208,3 +208,70 @@ def performance_guard(final_metrics, direct_metrics) -> PerformanceGuardResult:
         both_improved=both,
         tradeoff_warning=score_improved and not both,
     )
+
+
+def _row_ranks(values):
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(values.size, dtype=np.float64)
+    return ranks
+
+
+def routing_ranking_metrics(policy_scores, oracle_utility):
+    """Top-k and rank diagnostics computed independently for each patient."""
+    policy = np.asarray(policy_scores, dtype=np.float64)
+    utility = np.asarray(oracle_utility, dtype=np.float64)
+    if policy.shape != utility.shape or policy.ndim != 2:
+        raise ValueError("policy_scores and oracle_utility must share [B, N] shape")
+    count = policy.shape[1]
+    oracle_best = utility.argmax(1)
+    policy_order = np.argsort(-policy, axis=1)
+    output = {
+        "oracle_top1_agreement": float(np.mean(policy_order[:, 0] == oracle_best))
+    }
+    for k in (3, 5):
+        width = min(k, count)
+        output[f"oracle_top{k}_recall"] = float(
+            np.mean([
+                oracle_best[row] in policy_order[row, :width]
+                for row in range(policy.shape[0])
+            ])
+        )
+    ndcg_rows, spearman_rows = [], []
+    for row in range(policy.shape[0]):
+        width = min(5, count)
+        relevance = utility[row] - np.min(utility[row])
+        predicted_rel = relevance[policy_order[row, :width]]
+        ideal_rel = np.sort(relevance)[::-1][:width]
+        discounts = 1.0 / np.log2(np.arange(width) + 2.0)
+        dcg = float(np.sum(predicted_rel * discounts))
+        ideal = float(np.sum(ideal_rel * discounts))
+        ndcg_rows.append(dcg / ideal if ideal > 1e-12 else 1.0)
+        left, right = _row_ranks(policy[row]), _row_ranks(utility[row])
+        if np.std(left) <= 1e-12 or np.std(right) <= 1e-12:
+            spearman_rows.append(0.0)
+        else:
+            spearman_rows.append(float(np.corrcoef(left, right)[0, 1]))
+    output["ndcg_at_5"] = float(np.mean(ndcg_rows))
+    output["utility_spearman"] = float(np.mean(spearman_rows))
+    selected = policy_order[:, 0]
+    regret = utility[np.arange(utility.shape[0]), oracle_best] - utility[
+        np.arange(utility.shape[0]), selected
+    ]
+    output["mean_utility_regret"] = float(np.mean(regret))
+    output["median_utility_regret"] = float(np.median(regret))
+    output["p90_utility_regret"] = float(np.percentile(regret, 90))
+    return output
+
+
+def oracle_within_topk_indices(policy_scores, oracle_utility, k):
+    """Diagnostic-only oracle choice restricted to learned policy top-k."""
+    policy = np.asarray(policy_scores, dtype=np.float64)
+    utility = np.asarray(oracle_utility, dtype=np.float64)
+    if policy.shape != utility.shape or policy.ndim != 2:
+        raise ValueError("policy_scores and oracle_utility must share [B, N] shape")
+    width = min(int(k), policy.shape[1])
+    topk = np.argsort(-policy, axis=1)[:, :width]
+    local = np.take_along_axis(utility, topk, axis=1).argmax(1)
+    return topk[np.arange(topk.shape[0]), local]
