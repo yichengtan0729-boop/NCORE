@@ -1,0 +1,40 @@
+include_paths:
+  - configs/ncore_performance_v5_smoke.yaml
+  - configs/ncore_performance_v6.yaml
+
+experiment:
+  name: ncore_performance_v6_smoke
+  formal_v5: false
+  formal_v6: false
+  seed_subdirectory: false
+
+training:
+  epochs_direct: 2
+  epochs_operator_warmup: 2
+  epochs_supervised: 2
+  epochs_policy_warmup: 2
+  epochs_grpo: 2
+  strong_direct_init_checkpoint: none
+  require_strong_direct_init: false
+  oracle_candidates: 6
+  policy_warmup_candidates: 6
+
+model:
+  performance_v6:
+    routing:
+      num_candidates: 6
+      policy_topk: 3
+    reranker:
+      hidden_dim: 32
+      path_embedding_dim: 16
+
+routing:
+  num_candidates: 6
+  policy_topk: 3
+
+reranker:
+  hidden_dim: 32
+  topk: 3
+
+grpo:
+  group_size: 2
