@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any
 from contextlib import nullcontext
+import copy
 import json
 import random
 import shutil
@@ -25,6 +26,7 @@ from .metrics import (
     metric_sort_key,
     normalized_auprc,
     performance_guard,
+    routing_ranking_metrics,
     select_ensemble_weights,
 )
 from .sampling import PositiveAwareBatchSampler, apply_modality_dropout
@@ -41,6 +43,10 @@ from .losses import (
     precision_ranking_loss,
     normalized_gate_supervision_loss,
     oracle_candidate_utility,
+    patient_wise_utility_normalize,
+    path_distillation_loss,
+    reranker_objective,
+    categorical_policy_kl,
     reason_gate_loss,
     residual_utility_ranking_loss,
 )
@@ -527,6 +533,195 @@ def supervised_round_robin(model, batch, fixed_alpha=None):
     return outputs
 
 
+def _is_v6(model):
+    return bool(getattr(model, "performance_v6", False))
+
+
+def _load_torch_checkpoint(path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _strong_direct_prefix(name):
+    return name.startswith(
+        (
+            "encoders.",
+            "direct_projections.",
+            "direct_fusion.",
+            "direct_head.",
+            "direct_attention_enhancer.",
+        )
+    ) or name == "direct_temperature"
+
+
+def _anchor_metric(metrics, task_name, metric):
+    for key in (
+        f"strong_direct_{metric}_{task_name}",
+        f"base_{metric}_{task_name}",
+        f"direct_{metric}_{task_name}",
+        f"{metric}_{task_name}",
+    ):
+        value = metrics.get(key)
+        if value is not None and np.isfinite(value):
+            return float(value)
+    return float("-inf")
+
+
+def discover_strong_direct_checkpoint(cfg, output_dir):
+    configured = cfg.get("training", {}).get("strong_direct_init_checkpoint")
+    if configured and str(configured).lower() not in {"auto", "none"}:
+        path = Path(configured).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Configured strong direct checkpoint not found: {path}"
+            )
+        return path
+    root = Path(cfg["paths"]["output_root"]).expanduser()
+    candidates = set()
+    for pattern in (
+        "**/best_direct.pt",
+        "**/best_direct_v5.pt",
+        "**/best_supervised.pt",
+        "**/best.pt",
+    ):
+        candidates.update(root.glob(pattern))
+    candidates = [
+        path for path in candidates
+        if path.is_file() and Path(output_dir) not in path.parents
+    ]
+    if not candidates:
+        return None
+    task_name = cfg["experiment"]["task_names"][0]
+    ranked = []
+    model_shapes = None
+    for path in candidates:
+        try:
+            state = _load_torch_checkpoint(path, "cpu")
+            metrics = state.get("metrics", {})
+            checkpoint_model = state.get("model", state)
+            compatible = sum(
+                1
+                for raw_name, value in checkpoint_model.items()
+                for name in [raw_name.removeprefix("module.")]
+                if _strong_direct_prefix(name)
+                and torch.is_tensor(value)
+            )
+            ranked.append(
+                (
+                    _anchor_metric(metrics, task_name, "auroc"),
+                    _anchor_metric(metrics, task_name, "auprc"),
+                    compatible,
+                    path,
+                )
+            )
+        except (OSError, RuntimeError, ValueError, TypeError):
+            continue
+    return max(ranked, default=(None, None, None, None))[-1]
+
+
+@torch.no_grad()
+def initialize_strong_direct_anchor(
+    model, val_loader, cfg, device, output_dir
+):
+    """Load only the known direct anchor and validate it before formal training."""
+    checkpoint_path = discover_strong_direct_checkpoint(cfg, output_dir)
+    required = bool(
+        cfg.get("training", {}).get(
+            "require_strong_direct_init", _is_v6(model)
+        )
+    )
+    if checkpoint_path is None:
+        message = "[direct-anchor-warning] no strong direct checkpoint found"
+        print(message)
+        if required:
+            raise FileNotFoundError(
+                message
+                + "; set training.strong_direct_init_checkpoint to a known checkpoint"
+            )
+        return None
+    state = _load_torch_checkpoint(checkpoint_path, device)
+    source = state.get("model", state)
+    current = model.state_dict()
+    loaded, unexpected = [], []
+    for raw_name, value in source.items():
+        name = raw_name.removeprefix("module.")
+        if not _strong_direct_prefix(name):
+            continue
+        if name in current and current[name].shape == value.shape:
+            current[name] = value.to(
+                device=current[name].device, dtype=current[name].dtype
+            )
+            loaded.append(name)
+        else:
+            unexpected.append(raw_name)
+    model.load_state_dict(current, strict=True)
+    anchor_names = [name for name in current if _strong_direct_prefix(name)]
+    missing = sorted(set(anchor_names) - set(loaded))
+    previous_fallback = bool(model.use_strong_direct_fallback.item())
+    model.set_strong_direct_fallback(True)
+    metrics = evaluate_model(
+        model,
+        val_loader,
+        cfg,
+        device,
+        deterministic=True,
+        split="val",
+        stage="direct",
+    )
+    model.set_strong_direct_fallback(previous_fallback)
+    task_name = cfg["experiment"]["task_names"][0]
+    auroc = float(metrics[f"direct_auroc_{task_name}"])
+    auprc = float(metrics[f"direct_auprc_{task_name}"])
+    print(
+        "[strong-direct-init] "
+        f"path={checkpoint_path} loaded_keys={len(loaded)} "
+        f"missing_keys={missing} unexpected_keys={unexpected} "
+        f"val_auroc={auroc:.6f} val_auprc={auprc:.6f}"
+    )
+    report = {
+        "checkpoint": str(checkpoint_path),
+        "loaded_keys": sorted(loaded),
+        "missing_keys": missing,
+        "unexpected_keys": unexpected,
+        "val_auroc": auroc,
+        "val_auprc": auprc,
+    }
+    (Path(output_dir) / "strong_direct_init_report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    if auroc < 0.83:
+        print("[direct-anchor-warning] strong direct warm start failed")
+    if auroc < 0.80 and required:
+        raise RuntimeError(
+            "[direct-anchor-warning] strong direct warm start failed: "
+            f"validation AUROC {auroc:.6f} < 0.80"
+        )
+    return metrics
+
+
+def _direct_candidate_is_pareto_safe(metrics, cfg):
+    task_name = cfg["experiment"]["task_names"][0]
+    selection = cfg.get("selection", {})
+    if bool(cfg.get("model", {}).get("performance_v6", {}).get("enabled", False)):
+        reason_rate = metrics.get("reason_rate")
+        if reason_rate is not None and not 0.10 <= float(reason_rate) <= 0.90:
+            print(
+                "[reason-rate-guard] checkpoint rejected: "
+                f"reason_rate={float(reason_rate):.6f}"
+            )
+            return False
+    return checkpoint_passes_direct_guard(
+        metrics[f"direct_auroc_{task_name}"],
+        metrics[f"direct_auprc_{task_name}"],
+        metrics[f"strong_direct_auroc_{task_name}"],
+        metrics[f"strong_direct_auprc_{task_name}"],
+        float(selection.get("tolerance_auroc", 0.001)),
+        float(selection.get("tolerance_auprc", 0.002)),
+    )
+
+
 def _set_module_trainable(module, enabled):
     if module is None:
         return
@@ -585,6 +780,7 @@ def configure_trainable_parameters(model, cfg, stage, epoch=None):
         parameter.requires_grad = False
 
     v5 = bool(getattr(model, "performance_v5", False))
+    v6 = _is_v6(model)
 
     if stage == "direct" and v5:
         _set_module_trainable(model.pairwise_residual, True)
@@ -624,10 +820,15 @@ def configure_trainable_parameters(model, cfg, stage, epoch=None):
         _set_module_trainable(model.reason_gate, True)
     if v5 and stage == "supervised":
         _set_module_trainable(model.policy, True)
+        if v6:
+            _set_module_trainable(model.reranker, True)
+    if v6 and stage == "policy_warmup":
+        _set_module_trainable(model.reason_gate, epoch is not None and int(epoch) >= 7)
+        _set_module_trainable(model.reranker, epoch is not None and int(epoch) >= 4)
 
     if stage == "grpo":
         if v5:
-            # v5 GRPO refines WHETHER/HOW routing and cannot alter predictors.
+            # v6 GRPO is a small, KL-anchored routing refinement.
             _set_module_trainable(model.encoders, False)
             _set_operator_trainable(model, False)
             _set_module_trainable(model.patient_operator_gate, False)
@@ -636,8 +837,16 @@ def configure_trainable_parameters(model, cfg, stage, epoch=None):
             _set_module_trainable(model.direct_projections, False)
             _set_module_trainable(model.direct_fusion, False)
             _set_module_trainable(model.direct_head, False)
-            _set_module_trainable(model.reason_gate, True)
-            _set_module_trainable(model.policy, True)
+            if v6:
+                _set_module_trainable(model.policy, False)
+                _set_module_trainable(model.reason_gate, False)
+                _set_module_trainable(model.reranker, False)
+                _set_module_trainable(model.policy.net[-1], True)
+                _set_module_trainable(model.reason_gate.network[-1], True)
+                _set_module_trainable(model.reranker.last_layer, True)
+            else:
+                _set_module_trainable(model.reason_gate, True)
+                _set_module_trainable(model.policy, True)
             return
         if bool(cfg["training"].get("freeze_encoders_during_grpo", True)):
             _set_module_trainable(model.encoders, False)
@@ -672,10 +881,21 @@ def make_optimizer(model, cfg, stage):
     training_cfg = cfg["training"]
     legacy_lr = float(training_cfg.get("lr", 1e-4))
     buckets = {}
+    v6 = _is_v6(model)
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith("pairwise_residual."):
+        if stage == "grpo" and v6:
+            key = (
+                "grpo_routing",
+                float(cfg.get("grpo", {}).get("lr_policy", 3e-6)),
+            )
+        elif name.startswith("reranker."):
+            key = (
+                "reranker",
+                float(training_cfg.get("lr_reranker", training_cfg.get("lr_policy", 5e-5))),
+            )
+        elif name.startswith("pairwise_residual."):
             key = ("pairwise", float(training_cfg.get("lr_pairwise", 3e-4)))
         elif name.startswith("pooling_residual."):
             key = ("pool", float(training_cfg.get("lr_pool", 3e-4)))
@@ -990,6 +1210,11 @@ def train_direct(model, train_loader, val_loader, cfg, device, output_dir,
         int(resume_state.get("epoch", -1)) + 1
         if resume_state and resume_state.get("stage") == "direct" else 0
     )
+    anchor_metrics = None
+    if v5 and _is_v6(model) and start_epoch == 0:
+        anchor_metrics = initialize_strong_direct_anchor(
+            model, val_loader, cfg, device, output_dir
+        )
     configure_trainable_parameters(model, cfg, "direct", epoch=start_epoch)
     optimizer = make_optimizer(model, cfg, "direct")
     if resume_state and resume_state.get("stage") == "direct" and "optimizer" in resume_state:
@@ -999,6 +1224,22 @@ def train_direct(model, train_loader, val_loader, cfg, device, output_dir,
             print("[resume-warning] direct phase changed; optimizer state restarted")
     parameters = [p for p in model.parameters() if p.requires_grad]
     best = raw_best = ema_best = swa_best = float("-inf")
+    if anchor_metrics is not None:
+        best = _primary_score(anchor_metrics, cfg)
+        model.set_strong_direct_fallback(True)
+        for name in ("best_strong_direct.pt", "best_direct.pt", "best_direct_v6.pt"):
+            _save_checkpoint(
+                output_dir / name,
+                model,
+                optimizer,
+                cfg,
+                "direct",
+                -1,
+                anchor_metrics,
+                pos_weight,
+                selected_variant="strong_direct_fallback",
+            )
+        model.set_strong_direct_fallback(False)
     nonfinite_state = {}
     epochs = int(cfg["training"].get("epochs_direct", cfg["training"].get("epochs_supervised", 1)))
     ema_cfg = cfg["training"].get("ema", {})
@@ -1095,7 +1336,23 @@ def train_direct(model, train_loader, val_loader, cfg, device, output_dir,
             variants.append(("ema", ema_score, ema_metrics))
         if swa_metrics is not None:
             variants.append(("swa", swa_score, swa_metrics))
-        winner, score, metrics = max(variants, key=lambda row: row[1])
+        safe_variants = [
+            row for row in variants
+            if (not _is_v6(model)) or _direct_candidate_is_pareto_safe(row[2], cfg)
+        ]
+        safe_to_save = bool(safe_variants)
+        winner, score, metrics = max(
+            safe_variants or variants, key=lambda row: row[1]
+        )
+        if _is_v6(model) and not safe_to_save:
+            task_name = cfg["experiment"]["task_names"][0]
+            print(
+                "[direct-anchor-warning] full direct rejected; "
+                f"strong_auroc={metrics[f'strong_direct_auroc_{task_name}']:.6f} "
+                f"direct_auroc={metrics[f'direct_auroc_{task_name}']:.6f} "
+                f"strong_auprc={metrics[f'strong_direct_auprc_{task_name}']:.6f} "
+                f"direct_auprc={metrics[f'direct_auprc_{task_name}']:.6f}"
+            )
         print(
             f"[direct] epoch={epoch} loss={np.mean(losses):.4f} "
             f"phase={'A' if epoch < freeze_epochs else 'B'} "
@@ -1113,18 +1370,30 @@ def train_direct(model, train_loader, val_loader, cfg, device, output_dir,
             output_dir, model, optimizer, cfg, "direct", epoch, raw_metrics,
             pos_weight, loss_is_finite=bool(losses), **extra
         )
-        if _should_save_best(raw_score, raw_best, epoch, start_epoch):
+        if (
+            (not _is_v6(model) or _direct_candidate_is_pareto_safe(raw_metrics, cfg))
+            and _should_save_best(raw_score, raw_best, epoch, start_epoch)
+        ):
             raw_best = raw_score
             _save_checkpoint(output_dir / "best_direct_raw.pt", model, optimizer, cfg, "direct", epoch, raw_metrics, pos_weight, selected_variant="raw", **extra)
-        if ema is not None and _should_save_best(ema_score, ema_best, epoch, start_epoch):
+        if (
+            ema is not None
+            and (not _is_v6(model) or _direct_candidate_is_pareto_safe(ema_metrics, cfg))
+            and _should_save_best(ema_score, ema_best, epoch, start_epoch)
+        ):
             ema_best = ema_score
             with ema.average_parameters(model):
                 _save_checkpoint(output_dir / "best_direct_ema.pt", model, optimizer, cfg, "direct", epoch, ema_metrics, pos_weight, selected_variant="ema", **extra)
-        if swa is not None and swa_metrics is not None and _should_save_best(swa_score, swa_best, epoch, start_epoch):
+        if (
+            swa is not None
+            and swa_metrics is not None
+            and (not _is_v6(model) or _direct_candidate_is_pareto_safe(swa_metrics, cfg))
+            and _should_save_best(swa_score, swa_best, epoch, start_epoch)
+        ):
             swa_best = swa_score
             with swa.average_parameters(model):
                 _save_checkpoint(output_dir / "best_direct_swa.pt", model, optimizer, cfg, "direct", epoch, swa_metrics, pos_weight, selected_variant="swa", **extra)
-        if _should_save_best(score, best, epoch, start_epoch):
+        if safe_to_save and _should_save_best(score, best, epoch, start_epoch):
             best = score
             context = (
                 ema.average_parameters(model) if winner == "ema"
@@ -1263,16 +1532,46 @@ def train_supervised(model, train_loader, val_loader, cfg, device, output_dir,
             batch = apply_modality_dropout(batch, cfg)
             model.set_numerics_context("supervised", epoch, batch_idx)
             oracle_diagnostics = {}
+            oracle_set = None
             if getattr(model, "performance_v5", False):
                 model.eval()
-                best_actions, best_gain, _, oracle_diagnostics = select_oracle_candidate(
-                    model,
-                    batch,
-                    pos_weight,
-                    candidate_count=int(
-                        cfg["training"].get("oracle_candidates", 12)
-                    ),
-                )
+                if _is_v6(model):
+                    routing_cfg = model.performance_v6_cfg.get(
+                        "routing", cfg.get("routing", {})
+                    )
+                    with torch.no_grad():
+                        oracle_set = build_oracle_candidate_set(
+                            model,
+                            batch,
+                            pos_weight,
+                            candidate_count=int(
+                                routing_cfg.get("num_candidates", 24)
+                            ),
+                        )
+                    best_index = oracle_set["utility"].argmax(1)
+                    best_actions = torch.stack(
+                        [
+                            oracle_set["paths"][index][sample]
+                            for sample, index in enumerate(best_index.tolist())
+                        ],
+                        0,
+                    )
+                    best_gain = oracle_set["bce_gain"].gather(
+                        1, best_index[:, None]
+                    ).squeeze(1)
+                    oracle_diagnostics = routing_ranking_metrics(
+                        oracle_set["policy_scores"].cpu().numpy(),
+                        oracle_set["utility"].cpu().numpy(),
+                    )
+                else:
+                    best_actions, best_gain, _, oracle_diagnostics = select_oracle_candidate(
+                        model,
+                        batch,
+                        pos_weight,
+                        candidate_count=int(
+                            cfg["training"].get("oracle_candidates", 12)
+                        ),
+                    )
                 model.train()
                 outputs = model.rollout_actions(batch, best_actions)
             else:
@@ -1294,20 +1593,77 @@ def train_supervised(model, train_loader, val_loader, cfg, device, output_dir,
                     ),
                 )
                 useful = best_gain > 0
-                if useful.any():
+                if _is_v6(model) and oracle_set is not None:
+                    policy_scores = differentiable_candidate_scores(
+                        model,
+                        batch,
+                        oracle_set["paths"],
+                        oracle_set["encoded"],
+                        oracle_set["operators"],
+                    )
+                    routing_cfg = model.performance_v6_cfg.get(
+                        "routing", cfg.get("routing", {})
+                    )
+                    path_loss, path_parts = path_distillation_loss(
+                        policy_scores,
+                        oracle_set["utility"],
+                        temperature=float(
+                            routing_cfg.get("oracle_temperature", 0.20)
+                        ),
+                        listwise_weight=float(
+                            routing_cfg.get("listwise_weight", 0.50)
+                        ),
+                        top1_weight=float(
+                            routing_cfg.get("top1_ce_weight", 0.30)
+                        ),
+                        pairwise_weight=float(
+                            routing_cfg.get("pairwise_weight", 0.20)
+                        ),
+                    )
+                    reranker_scores = candidate_reranker_scores(
+                        model,
+                        batch,
+                        oracle_set["paths"],
+                        oracle_set["encoded"],
+                        oracle_set["operators"],
+                    )
+                    reranker_cfg = model.performance_v6_cfg.get(
+                        "reranker", cfg.get("reranker", {})
+                    )
+                    reranker_loss, reranker_parts = reranker_objective(
+                        reranker_scores,
+                        oracle_set["utility"],
+                        policy_scores.detach(),
+                        regression_weight=float(
+                            reranker_cfg.get("regression_weight", 0.50)
+                        ),
+                        ranking_weight=float(
+                            reranker_cfg.get("ranking_weight", 0.50)
+                        ),
+                    )
+                elif useful.any():
                     path_loss = -outputs["path_logprob"][useful].mean()
+                    path_parts, reranker_parts = {}, {}
+                    reranker_loss = path_loss * 0.0
                 else:
                     path_loss = outputs["path_logprob"].sum() * 0.0
+                    path_parts, reranker_parts = {}, {}
+                    reranker_loss = path_loss * 0.0
                 oracle_weight = float(
                     cfg["training"].get("oracle_loss_weight", 0.60)
                 )
-                loss = loss + oracle_weight * (reason_loss + path_loss)
+                loss = loss + oracle_weight * (
+                    reason_loss + path_loss + reranker_loss
+                )
                 diagnostics.update(
                     {
                         "reason_loss": reason_loss,
                         "reason_bce": reason_parts["bce"],
                         "path_distillation": path_loss,
+                        "reranker_loss": reranker_loss,
                         "oracle_useful_fraction": useful.float().mean(),
+                        **path_parts,
+                        **reranker_parts,
                     }
                 )
             loss = loss + operator_regularization(model, outputs["operators"], cfg)
@@ -1635,18 +1991,23 @@ def sample_diverse_candidate_paths(
 
 
 @torch.no_grad()
-def select_oracle_candidate(model, batch, pos_weight, candidate_count=12):
+def build_oracle_candidate_set(model, batch, pos_weight, candidate_count=24):
+    """Build label-aware train/diagnostic targets; never called by inference."""
     encoded = model.encode(batch)
     operators = model.build_operators(encoded, batch["modality_mask"])
     paths = sample_diverse_candidate_paths(
-        model, batch, encoded=encoded, operators=operators,
-        candidate_count=candidate_count
+        model,
+        batch,
+        encoded=encoded,
+        operators=operators,
+        candidate_count=candidate_count,
     )
     direct = model.direct_outputs(encoded, batch["modality_mask"])["direct_logits"]
     direct_loss = per_sample_masked_bce(
         direct, batch["labels"], batch["label_mask"], pos_weight
     )
     candidate_logits, bce_gains, rank_gains, pr_gains = [], [], [], []
+    policy_scores = []
     signed = batch["labels"] * 2.0 - 1.0
     valid_count = batch["label_mask"].sum(1).clamp_min(1.0)
     direct_probability = torch.sigmoid(direct.detach())
@@ -1656,6 +2017,7 @@ def select_oracle_candidate(model, batch, pos_weight, candidate_count=12):
         )
         logits = rollout["logits"]
         candidate_logits.append(logits)
+        policy_scores.append(rollout["path_logprob"])
         candidate_loss = per_sample_masked_bce(
             logits, batch["labels"], batch["label_mask"], pos_weight
         )
@@ -1676,14 +2038,44 @@ def select_oracle_candidate(model, batch, pos_weight, candidate_count=12):
     bce_gain = torch.stack(bce_gains, 1)
     rank_gain = torch.stack(rank_gains, 1)
     pr_gain = torch.stack(pr_gains, 1)
-    utility = oracle_candidate_utility(bce_gain, rank_gain, pr_gain)
+    weights = (
+        (0.45, 0.30, 0.25)
+        if _is_v6(model)
+        else (0.50, 0.25, 0.25)
+    )
+    utility = oracle_candidate_utility(
+        bce_gain, rank_gain, pr_gain, weights=weights
+    )
+    return {
+        "encoded": encoded,
+        "operators": operators,
+        "paths": paths,
+        "actions": torch.stack(paths, 1),
+        "candidate_logits": torch.stack(candidate_logits, 1),
+        "policy_scores": torch.stack(policy_scores, 1),
+        "bce_gain": bce_gain,
+        "rank_gain": rank_gain,
+        "pr_gain": pr_gain,
+        "utility": patient_wise_utility_normalize(utility),
+    }
+
+
+@torch.no_grad()
+def select_oracle_candidate(model, batch, pos_weight, candidate_count=12):
+    details = build_oracle_candidate_set(
+        model, batch, pos_weight, candidate_count=candidate_count
+    )
+    utility = details["utility"]
     best_utility, best_index = utility.max(1)
+    paths = details["paths"]
     best_actions = torch.stack(
         [paths[index][sample] for sample, index in enumerate(best_index.tolist())],
         0,
     )
-    best_bce_gain = bce_gain.gather(1, best_index.unsqueeze(1)).squeeze(1)
-    all_actions = torch.stack(paths, 1)
+    best_bce_gain = details["bce_gain"].gather(
+        1, best_index.unsqueeze(1)
+    ).squeeze(1)
+    all_actions = details["actions"]
     all_modalities = all_actions.clamp_max(model.stop_idx - 1) // model.K
     best_modalities = best_actions.clamp_max(model.stop_idx - 1) // model.K
     coverage, best_distribution = [], []
@@ -1697,7 +2089,38 @@ def select_oracle_candidate(model, batch, pos_weight, candidate_count=12):
         "candidate_modality_coverage": coverage,
         "best_path_modality_distribution": best_distribution,
     }
+    diagnostics.update(
+        routing_ranking_metrics(
+            details["policy_scores"].cpu().numpy(),
+            utility.cpu().numpy(),
+        )
+    )
     return best_actions, best_bce_gain, best_utility, diagnostics
+
+
+def differentiable_candidate_scores(model, batch, paths, encoded, operators):
+    scores = []
+    for actions in paths:
+        rollout = model.rollout_actions(
+            batch, actions, encoded=encoded, operators=operators
+        )
+        scores.append(rollout["path_logprob"])
+    return torch.stack(scores, 1)
+
+
+def candidate_reranker_scores(model, batch, paths, encoded, operators):
+    if model.reranker is None:
+        raise RuntimeError("v6 reranker is required")
+    scores = []
+    for actions in paths:
+        with torch.no_grad():
+            rollout = model.rollout_actions(
+                batch, actions, encoded=encoded, operators=operators
+            )
+        scores.append(
+            model.score_candidate_rollout(rollout, batch["modality_mask"])
+        )
+    return torch.stack(scores, 1)
 
 
 def select_policy_checkpoint(output_dir, cfg=None):
@@ -1727,6 +2150,11 @@ def select_policy_checkpoint(output_dir, cfg=None):
     if not records:
         return None
     eligible = [record for record in records if 0.1 <= record[1] <= 0.9]
+    if cfg is not None and bool(
+        cfg.get("model", {}).get("performance_v6", {}).get("enabled", False)
+    ) and not eligible:
+        print("[reason-rate-guard] no eligible policy checkpoint")
+        return None
     selected = (
         max(eligible, key=lambda item: item[2])
         if eligible
@@ -1872,8 +2300,253 @@ def load_saved_correction_bound(model, output_dir):
     return value
 
 
+def _train_policy_warmup_v6(
+    model, train_loader, val_loader, cfg, device, output_dir,
+    pos_weight=None, resume_state=None,
+):
+    if pos_weight is None:
+        pos_weight, _ = compute_train_pos_weight(train_loader, device)
+    start_epoch = (
+        int(resume_state.get("epoch", -1)) + 1
+        if resume_state and resume_state.get("stage") == "policy_warmup"
+        else 0
+    )
+    routing_cfg = model.performance_v6_cfg.get(
+        "routing", cfg.get("routing", {})
+    )
+    reranker_cfg = model.performance_v6_cfg.get(
+        "reranker", cfg.get("reranker", {})
+    )
+    candidate_count = int(routing_cfg.get("num_candidates", 24))
+    nonfinite_state = {}
+    optimizer = None
+    parameters = []
+    current_phase = None
+    for epoch in range(start_epoch, int(cfg["training"]["epochs_policy_warmup"])):
+        phase = 1 if epoch < 4 else 2 if epoch < 7 else 3
+        if phase != current_phase:
+            configure_trainable_parameters(
+                model, cfg, "policy_warmup", epoch=epoch
+            )
+            optimizer = make_optimizer(model, cfg, "policy_warmup")
+            parameters = [
+                parameter
+                for parameter in model.parameters()
+                if parameter.requires_grad
+            ]
+            current_phase = phase
+        model.train()
+        model.reset_numerics_observations()
+        losses, statistic_rows = [], []
+        for batch_idx, batch in enumerate(train_loader):
+            batch = move_batch(batch, device)
+            batch = apply_modality_dropout(batch, cfg)
+            model.set_numerics_context("policy_warmup", epoch, batch_idx)
+            model.eval()
+            with torch.no_grad():
+                oracle = build_oracle_candidate_set(
+                    model,
+                    batch,
+                    pos_weight,
+                    candidate_count=candidate_count,
+                )
+            model.train()
+            policy_scores = differentiable_candidate_scores(
+                model,
+                batch,
+                oracle["paths"],
+                oracle["encoded"],
+                oracle["operators"],
+            )
+            path_loss, path_parts = path_distillation_loss(
+                policy_scores,
+                oracle["utility"],
+                temperature=float(routing_cfg.get("oracle_temperature", 0.20)),
+                listwise_weight=float(routing_cfg.get("listwise_weight", 0.50)),
+                top1_weight=float(routing_cfg.get("top1_ce_weight", 0.30)),
+                pairwise_weight=float(routing_cfg.get("pairwise_weight", 0.20)),
+            )
+            total = path_loss
+            reranker_scores = None
+            reranker_parts = {}
+            if epoch >= 4:
+                reranker_scores = candidate_reranker_scores(
+                    model,
+                    batch,
+                    oracle["paths"],
+                    oracle["encoded"],
+                    oracle["operators"],
+                )
+                reranker_loss, reranker_parts = reranker_objective(
+                    reranker_scores,
+                    oracle["utility"],
+                    policy_scores.detach(),
+                    regression_weight=float(
+                        reranker_cfg.get("regression_weight", 0.50)
+                    ),
+                    ranking_weight=float(
+                        reranker_cfg.get("ranking_weight", 0.50)
+                    ),
+                )
+                total = total + reranker_loss
+            reason_parts = {}
+            if epoch >= 7:
+                best_index = oracle["utility"].argmax(1)
+                best_actions = torch.stack(
+                    [
+                        oracle["paths"][index][sample]
+                        for sample, index in enumerate(best_index.tolist())
+                    ],
+                    0,
+                )
+                reason_rollout = model.rollout_actions(
+                    batch,
+                    best_actions,
+                    encoded=oracle["encoded"],
+                    operators=oracle["operators"],
+                )
+                best_gain = oracle["bce_gain"].gather(
+                    1, best_index[:, None]
+                ).squeeze(1)
+                reason_loss, reason_parts = reason_gate_loss(
+                    reason_rollout["reason_probability"],
+                    best_gain,
+                    focal_gamma=float(
+                        cfg["training"].get("policy_warmup", {}).get(
+                            "focal_gamma", 1.5
+                        )
+                    ),
+                )
+                total = total + reason_loss
+            if not _clip_and_step(
+                total,
+                optimizer,
+                parameters,
+                cfg,
+                model=model,
+                stage="policy_warmup",
+                epoch=epoch,
+                batch_idx=batch_idx,
+                nonfinite_state=nonfinite_state,
+            ):
+                continue
+            losses.append(float(total.detach()))
+            policy_diag = routing_ranking_metrics(
+                policy_scores.detach().cpu().numpy(),
+                oracle["utility"].cpu().numpy(),
+            )
+            row = dict(policy_diag)
+            row.update(
+                {
+                    f"path_{key}": float(value.detach())
+                    for key, value in path_parts.items()
+                }
+            )
+            if reranker_scores is not None:
+                reranker_diag = routing_ranking_metrics(
+                    reranker_scores.detach().cpu().numpy(),
+                    oracle["utility"].cpu().numpy(),
+                )
+                row.update(
+                    {
+                        "reranker_top1_agreement": reranker_diag[
+                            "oracle_top1_agreement"
+                        ],
+                        "reranker_top3_recall": reranker_diag[
+                            "oracle_top3_recall"
+                        ],
+                        "reranker_mean_utility_regret": reranker_diag[
+                            "mean_utility_regret"
+                        ],
+                    }
+                )
+                row.update(
+                    {
+                        key: float(value.detach())
+                        for key, value in reranker_parts.items()
+                    }
+                )
+            if reason_parts:
+                row["reason_bce"] = float(reason_parts["bce"].detach())
+            statistic_rows.append(row)
+        metrics = evaluate_model(
+            model,
+            val_loader,
+            cfg,
+            device,
+            deterministic=True,
+            split="val",
+            pos_weight=pos_weight,
+            stage="policy_warmup",
+            epoch=epoch,
+            include_oracle=True,
+        )
+        statistics = _mean_diagnostics(statistic_rows)
+        metrics.update({f"train_{key}": value for key, value in statistics.items()})
+        print(
+            f"[policy_warmup] epoch={epoch} phase={phase} "
+            f"loss={np.mean(losses):.4f} routing={statistics} metrics={metrics}"
+        )
+        _save_checkpoint(
+            output_dir / "last_policy_warmup.pt",
+            model,
+            optimizer,
+            cfg,
+            "policy_warmup",
+            epoch,
+            metrics,
+            pos_weight,
+        )
+        _save_checkpoint(
+            output_dir / f"policy_epoch_{epoch}.pt",
+            model,
+            optimizer,
+            cfg,
+            "policy_warmup",
+            epoch,
+            metrics,
+            pos_weight,
+        )
+        _save_last_finite(
+            output_dir,
+            model,
+            optimizer,
+            cfg,
+            "policy_warmup",
+            epoch,
+            metrics,
+            pos_weight,
+            loss_is_finite=bool(losses),
+            skipped_batches=int(nonfinite_state.get("skipped", 0)),
+        )
+    selected_path = select_policy_checkpoint(output_dir, cfg)
+    if selected_path is not None:
+        selected_state = _load_torch_checkpoint(selected_path, device)
+        model.load_state_dict(selected_state["model"])
+    select_reason_threshold_from_validation(
+        model,
+        val_loader,
+        cfg,
+        device,
+        output_dir,
+        pos_weight,
+        stage="policy_warmup",
+    )
+
+
 def train_policy_warmup(model, train_loader, val_loader, cfg, device,
                         output_dir, pos_weight=None, resume_state=None):
+    if _is_v6(model):
+        return _train_policy_warmup_v6(
+            model,
+            train_loader,
+            val_loader,
+            cfg,
+            device,
+            output_dir,
+            pos_weight=pos_weight,
+            resume_state=resume_state,
+        )
     if pos_weight is None:
         pos_weight, _ = compute_train_pos_weight(train_loader, device)
     configure_trainable_parameters(model, cfg, "policy_warmup")
@@ -2235,11 +2908,16 @@ def select_top_v5_checkpoints(output_dir, cfg, limit=5):
     improved = [row for row in selected if row["score_improved"]]
     if improved:
         best_row = improved[0]
-        shutil.copyfile(best_row["path"], output_dir / "best_final_v5.pt")
+        is_v6 = bool(
+            cfg.get("model", {}).get("performance_v6", {}).get("enabled", False)
+        )
+        if not is_v6:
+            shutil.copyfile(best_row["path"], output_dir / "best_final_v5.pt")
+        elif best_row["both_improved"]:
+            shutil.copyfile(best_row["path"], output_dir / "best_final_v6.pt")
         if not best_row["both_improved"]:
             print(
-                "[tradeoff-warning] best_final_v5 improves validation dual "
-                "score but not both AUROC and AUPRC"
+                "[performance-warning] learned routing still below required gain"
             )
         print(
             "[final-selection] "
@@ -2328,11 +3006,26 @@ def train_grpo(model, train_loader, val_loader, cfg, device, output_dir,
     optimizer = make_optimizer(model, cfg, "grpo")
     parameters = [p for p in model.parameters() if p.requires_grad]
     start_epoch = _resume_optimizer(optimizer, resume_state, "grpo")
+    reference_policy = None
+    beta_kl = float(cfg.get("grpo", {}).get("kl_anchor_weight", 0.05))
+    previous_validation_score = None
+    if _is_v6(model):
+        reference_policy = copy.deepcopy(model.policy).to(device).eval()
+        if resume_state and "pi_ref_policy" in resume_state:
+            reference_policy.load_state_dict(resume_state["pi_ref_policy"])
+        for parameter in reference_policy.parameters():
+            parameter.requires_grad = False
+        if resume_state:
+            beta_kl = float(resume_state.get("beta_kl", beta_kl))
+            previous_validation_score = resume_state.get(
+                "previous_validation_score"
+            )
     if getattr(model, "performance_v5", False) and start_epoch == 0:
         for name in [
             "best.pt",
             "best_unconfirmed.pt",
             "best_final_v5.pt",
+            "best_final_v6.pt",
             "top5_checkpoints_v5.json",
             "ensemble_weights_v5.json",
         ]:
@@ -2403,6 +3096,12 @@ def train_grpo(model, train_loader, val_loader, cfg, device, output_dir,
                         "mean_stop_reward": float(components["total"][stop].mean()) if stop.any() else float("nan"),
                         "mean_nonstop_reward": float(components["total"][~stop].mean()) if (~stop).any() else float("nan"),
                         "mean_abs_raw_prediction_gain": float(components["raw_prediction_gain"].abs().mean()),
+                        "mean_reranker_consistency": float(
+                            components.get(
+                                "reranker_consistency",
+                                torch.zeros_like(components["total"]),
+                            ).mean()
+                        ),
                     }
                 )
             for _ in range(int(rl_cfg.get("grpo_epochs_per_batch", 1))):
@@ -2411,6 +3110,29 @@ def train_grpo(model, train_loader, val_loader, cfg, device, output_dir,
                 current = model.rollout_actions(
                     batch, actions, encoded=encoded, operators=operators
                 )
+                if reference_policy is not None:
+                    with torch.no_grad():
+                        reference = model.rollout_actions(
+                            batch,
+                            actions,
+                            encoded=encoded,
+                            operators=operators,
+                            policy_module=reference_policy,
+                        )
+                    kl_anchor = categorical_policy_kl(
+                        current["policy_logits_steps"],
+                        reference["policy_logits_steps"],
+                    )
+                    reranker_prediction = model.score_candidate_rollout(
+                        current, batch["modality_mask"]
+                    )
+                    reranker_refinement = torch.nn.functional.smooth_l1_loss(
+                        reranker_prediction.float(),
+                        components["total"].detach().float(),
+                    )
+                else:
+                    kl_anchor = current["logprob"].sum() * 0.0
+                    reranker_refinement = kl_anchor
                 policy_loss = clipped_grpo_loss(
                     current["logprob"],
                     old_logprob,
@@ -2428,6 +3150,8 @@ def train_grpo(model, train_loader, val_loader, cfg, device, output_dir,
                 total = (
                     policy_loss
                     + float(cfg["training"].get("grpo_supervised_anchor", 0.25)) * anchor
+                    + beta_kl * kl_anchor
+                    + 0.10 * reranker_refinement
                     + operator_regularization(model, operators, cfg)
                 )
                 if not _clip_and_step(
@@ -2451,10 +3175,36 @@ def train_grpo(model, train_loader, val_loader, cfg, device, output_dir,
         reward_statistics = _mean_diagnostics(reward_rows)
         metrics["adaptive_entropy_weight"] = entropy_weight
         score = _primary_score(metrics, cfg)
+        if (
+            _is_v6(model)
+            and previous_validation_score is not None
+            and score < float(previous_validation_score)
+        ):
+            beta_kl = max(beta_kl, 0.10)
+            print(f"[grpo-kl-anchor] validation declined; beta_kl={beta_kl:.3f}")
+        previous_validation_score = score
+        metrics["grpo_beta_kl"] = beta_kl
         print(
             f"[grpo] epoch={epoch} loss={np.mean(losses):.4f} "
             f"reward={reward_statistics} metrics={metrics}"
         )
+        if _is_v6(model):
+            delta_auroc = float(
+                metrics.get(
+                    f"delta_auroc_final_minus_direct_{task_name}", float("-inf")
+                )
+            )
+            delta_auprc = float(
+                metrics.get(
+                    f"delta_auprc_final_minus_direct_{task_name}", float("-inf")
+                )
+            )
+            if delta_auroc < 0.003 or delta_auprc < 0.005:
+                print(
+                    "[performance-warning] learned routing still below required gain "
+                    f"delta_auroc={delta_auroc:.6f} "
+                    f"delta_auprc={delta_auprc:.6f}"
+                )
         print(
             "[policy-numerics] "
             f"policy_logits_min={metrics.get('policy_logits_min')} "
@@ -2492,6 +3242,11 @@ def train_grpo(model, train_loader, val_loader, cfg, device, output_dir,
             metrics,
             pos_weight,
             adaptive_entropy_weight=entropy_weight,
+            beta_kl=beta_kl,
+            previous_validation_score=previous_validation_score,
+            pi_ref_policy=(
+                reference_policy.state_dict() if reference_policy is not None else None
+            ),
         )
         if getattr(model, "performance_v5", False):
             _save_checkpoint(
@@ -2553,10 +3308,16 @@ def train_grpo(model, train_loader, val_loader, cfg, device, output_dir,
             _print_best_validation("grpo", metrics, cfg)
 
     if getattr(model, "performance_v5", False):
-        fit_v5_ensemble_on_validation(
-            model, val_loader, cfg, device, output_dir
+        if bool(cfg.get("ensemble", {}).get("enabled", True)):
+            fit_v5_ensemble_on_validation(
+                model, val_loader, cfg, device, output_dir
+            )
+        elif _is_v6(model):
+            select_top_v5_checkpoints(output_dir, cfg, limit=5)
+            print("[ensemble] disabled for v6 single-model optimization")
+        selected_path = Path(output_dir) / (
+            "best_final_v6.pt" if _is_v6(model) else "best_final_v5.pt"
         )
-        selected_path = Path(output_dir) / "best_final_v5.pt"
         calibration_is_unconfirmed = False
         if not selected_path.exists():
             selected_path = Path(output_dir) / "best_unconfirmed.pt"
@@ -2620,13 +3381,18 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
     ):
         uses_policy = True
     labels, masks = [], []
-    base_logits_values, pair_logits_values, pool_logits_values = [], [], []
+    base_logits_values, strong_logits_values = [], []
+    pair_logits_values, pool_logits_values = [], []
     direct_logits_values, final_logits_values = [], []
     alpha_values, delta_values, raw_corrections, bounded_corrections = [], [], [], []
     reason_probabilities = []
     oracle_logits_values = []
+    oracle_at_k_logits_values = {1: [], 3: [], 5: []}
     oracle_agreement_values = []
     oracle_diagnostic_rows = []
+    policy_ranking_rows = []
+    reranker_ranking_rows = []
+    selected_utility_regrets = []
     lengths, policy_entropies, policy_logprobs = [], [], []
     action_counts = torch.zeros(model.num_actions, dtype=torch.long)
     reward_rows = []
@@ -2664,6 +3430,9 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
         labels.append(batch["labels"].cpu())
         masks.append(batch["label_mask"].cpu())
         base_logits_values.append(rollout["direct_base_logits"].cpu())
+        strong_logits_values.append(
+            rollout.get("strong_direct_logits", rollout["direct_base_logits"]).cpu()
+        )
         pair_logits_values.append(
             rollout.get("direct_pair_logits", rollout["direct_logits"]).cpu()
         )
@@ -2697,14 +3466,94 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
                 oracle_pos_weight = torch.ones(
                     batch["labels"].size(1), device=batch["labels"].device
                 )
-            oracle_actions, _, _, oracle_diagnostics = select_oracle_candidate(
-                model,
-                batch,
-                oracle_pos_weight,
-                candidate_count=int(cfg["training"].get("oracle_candidates", 12)),
-            )
-            oracle_rollout = model.rollout_actions(batch, oracle_actions)
-            oracle_logits_values.append(oracle_rollout["logits"].cpu())
+            if _is_v6(model):
+                routing_cfg = model.performance_v6_cfg.get(
+                    "routing", cfg.get("routing", {})
+                )
+                oracle_set = build_oracle_candidate_set(
+                    model,
+                    batch,
+                    oracle_pos_weight,
+                    candidate_count=int(routing_cfg.get("num_candidates", 24)),
+                )
+                utility = oracle_set["utility"]
+                policy_scores = oracle_set["policy_scores"]
+                best_index = utility.argmax(1)
+                oracle_actions = torch.stack(
+                    [
+                        oracle_set["paths"][index][sample]
+                        for sample, index in enumerate(best_index.tolist())
+                    ],
+                    0,
+                )
+                task_width = oracle_set["candidate_logits"].size(-1)
+                gather = best_index[:, None, None].expand(-1, 1, task_width)
+                oracle_logits_values.append(
+                    oracle_set["candidate_logits"].gather(1, gather).squeeze(1).cpu()
+                )
+                policy_diag = routing_ranking_metrics(
+                    policy_scores.cpu().numpy(), utility.cpu().numpy()
+                )
+                policy_ranking_rows.append(policy_diag)
+                reranker_scores = candidate_reranker_scores(
+                    model,
+                    batch,
+                    oracle_set["paths"],
+                    oracle_set["encoded"],
+                    oracle_set["operators"],
+                )
+                policy_order = policy_scores.argsort(1, descending=True)
+                for width in (1, 3, 5):
+                    top = policy_order[:, : min(width, policy_order.size(1))]
+                    top_utility = utility.gather(1, top)
+                    local = top_utility.argmax(1)
+                    chosen = top.gather(1, local[:, None]).squeeze(1)
+                    chosen_gather = chosen[:, None, None].expand(
+                        -1, 1, task_width
+                    )
+                    oracle_at_k_logits_values[width].append(
+                        oracle_set["candidate_logits"]
+                        .gather(1, chosen_gather)
+                        .squeeze(1)
+                        .cpu()
+                    )
+                topk_width = min(
+                    int(routing_cfg.get("policy_topk", 5)),
+                    policy_order.size(1),
+                )
+                allowed = torch.zeros_like(reranker_scores, dtype=torch.bool)
+                allowed.scatter_(1, policy_order[:, :topk_width], True)
+                restricted_reranker = reranker_scores.masked_fill(
+                    ~allowed, -torch.inf
+                )
+                reranker_diag = routing_ranking_metrics(
+                    restricted_reranker.cpu().numpy(), utility.cpu().numpy()
+                )
+                reranker_ranking_rows.append(reranker_diag)
+                selected_index = restricted_reranker.argmax(1)
+                selected_regret = (
+                    utility.max(1).values
+                    - utility.gather(1, selected_index[:, None]).squeeze(1)
+                )
+                selected_utility_regrets.append(selected_regret.cpu())
+                oracle_diagnostics = {
+                    "candidate_utility_std": float(
+                        utility.std(unbiased=False)
+                    ),
+                    "candidate_modality_coverage": [],
+                    "best_path_modality_distribution": [],
+                }
+            else:
+                oracle_actions, _, _, oracle_diagnostics = select_oracle_candidate(
+                    model,
+                    batch,
+                    oracle_pos_weight,
+                    candidate_count=int(
+                        cfg["training"].get("oracle_candidates", 12)
+                    ),
+                )
+                oracle_rollout = model.rollout_actions(batch, oracle_actions)
+                oracle_logits_values.append(oracle_rollout["logits"].cpu())
             oracle_diagnostic_rows.append(oracle_diagnostics)
             if uses_policy and "actions" in rollout:
                 oracle_agreement_values.append(
@@ -2746,6 +3595,7 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
     labels_np = torch.cat(labels).numpy()
     masks_np = torch.cat(masks).numpy()
     base_logits_np = torch.cat(base_logits_values).numpy()
+    strong_logits_np = torch.cat(strong_logits_values).numpy()
     pair_logits_np = torch.cat(pair_logits_values).numpy()
     pool_logits_np = torch.cat(pool_logits_values).numpy()
     direct_logits_np = torch.cat(direct_logits_values).numpy()
@@ -2754,6 +3604,11 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
         torch.cat(oracle_logits_values).numpy()
         if oracle_logits_values else None
     )
+    oracle_at_k_logits_np = {
+        width: torch.cat(rows).numpy()
+        for width, rows in oracle_at_k_logits_values.items()
+        if rows
+    }
     temperature = float(model.direct_temperature.detach().cpu())
     if not np.isfinite(temperature):
         raise FloatingPointError("direct_temperature is non-finite during evaluation")
@@ -2766,6 +3621,9 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
     direct_uncalibrated_np = sigmoid_array(direct_logits_np)
     final_uncalibrated_np = sigmoid_array(final_logits_np)
     base_np = sigmoid_array(np.clip(base_logits_np / temperature, -30.0, 30.0))
+    strong_np = sigmoid_array(
+        np.clip(strong_logits_np / temperature, -30.0, 30.0)
+    )
     direct_np = sigmoid_array(
         np.clip(direct_logits_np / temperature, -30.0, 30.0)
     )
@@ -2795,6 +3653,9 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
         base_auroc, base_auprc = _binary_metrics(
             task_labels, base_np[valid, task_index]
         )
+        strong_auroc, strong_auprc = _binary_metrics(
+            task_labels, strong_np[valid, task_index]
+        )
         direct_auroc, direct_auprc = _binary_metrics(
             task_labels, direct_np[valid, task_index]
         )
@@ -2814,6 +3675,8 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
         metrics[f"prevalence_{task_name}"] = prevalence
         metrics[f"base_auroc_{task_name}"] = base_auroc
         metrics[f"base_auprc_{task_name}"] = base_auprc
+        metrics[f"strong_direct_auroc_{task_name}"] = strong_auroc
+        metrics[f"strong_direct_auprc_{task_name}"] = strong_auprc
         metrics[f"direct_auroc_{task_name}"] = direct_auroc
         metrics[f"direct_auprc_{task_name}"] = direct_auprc
         metrics[f"pairwise_auroc_{task_name}"] = pair_auroc
@@ -2830,6 +3693,7 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
         metrics[f"delta_auprc_direct_minus_base_{task_name}"] = direct_auprc - base_auprc
         for prefix, auroc, auprc in [
             ("base", base_auroc, base_auprc),
+            ("strong_direct", strong_auroc, strong_auprc),
             ("pairwise", pair_auroc, pair_auprc),
             ("pooled", pool_auroc, pool_auprc),
             ("direct", direct_auroc, direct_auprc),
@@ -2858,10 +3722,19 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
             metrics[f"oracle_minus_learned_auprc_{task_name}"] = (
                 oracle_auprc - final_auprc
             )
+            for width, values in oracle_at_k_logits_np.items():
+                topk_probability = sigmoid_array(values[valid, task_index])
+                topk_auroc, topk_auprc = _binary_metrics(
+                    task_labels, topk_probability
+                )
+                metrics[f"oracle_at_{width}_auroc_{task_name}"] = topk_auroc
+                metrics[f"oracle_at_{width}_auprc_{task_name}"] = topk_auprc
             if task_index == 0:
                 metrics["oracle_auroc"] = oracle_auroc
                 metrics["oracle_auprc"] = oracle_auprc
                 metrics["learned_routing_gap"] = oracle_auroc - final_auroc
+                metrics["learned_routing_gap_auroc"] = oracle_auroc - final_auroc
+                metrics["learned_routing_gap_auprc"] = oracle_auprc - final_auprc
         probability_sets = {
             "base": (base_np, base_uncalibrated_np),
             "direct": (direct_np, direct_uncalibrated_np),
@@ -2926,6 +3799,7 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
     )
     if oracle_logits_np is not None:
         metrics["oracle_diagnostics_only"] = True
+        metrics["diagnostic_only"] = True
         metrics["oracle_path_agreement"] = (
             float(torch.cat(oracle_agreement_values).mean())
             if oracle_agreement_values else None
@@ -2939,6 +3813,30 @@ def evaluate_model(model, loader, cfg, device, deterministic=True, split=None,
             metrics[key] = np.asarray(values, dtype=np.float64).mean(0).tolist()
             if key == "candidate_utility_std":
                 metrics[key] = float(metrics[key])
+        if policy_ranking_rows:
+            for key in policy_ranking_rows[0]:
+                metrics[key] = float(
+                    np.mean([row[key] for row in policy_ranking_rows])
+                )
+        if reranker_ranking_rows:
+            metrics["reranker_top1_agreement"] = float(
+                np.mean(
+                    [
+                        row["oracle_top1_agreement"]
+                        for row in reranker_ranking_rows
+                    ]
+                )
+            )
+            metrics["reranker_top3_recall"] = float(
+                np.mean(
+                    [row["oracle_top3_recall"] for row in reranker_ranking_rows]
+                )
+            )
+        if selected_utility_regrets:
+            regret = torch.cat(selected_utility_regrets).numpy()
+            metrics["mean_utility_regret"] = float(np.mean(regret))
+            metrics["median_utility_regret"] = float(np.median(regret))
+            metrics["p90_utility_regret"] = float(np.percentile(regret, 90))
 
     expanded_alpha = np.repeat(alpha_np[:, None], direct_np.shape[1], axis=1)
     valid_all = masks_np > 0.5
