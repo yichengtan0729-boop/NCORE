@@ -1,0 +1,106 @@
+include_paths: configs/ncore_performance_v5_mortality.yaml
+
+experiment:
+  name: ncore_performance_v6
+  formal_v5: false
+  formal_v6: true
+  seed_subdirectory: true
+
+model:
+  performance_v5:
+    enabled: true
+    pairwise:
+      gate_init: 0.03
+      gate_max: 0.15
+    pooling:
+      gate_init: 0.02
+      gate_max: 0.10
+  performance_v6:
+    enabled: true
+    routing:
+      num_candidates: 24
+      policy_topk: 5
+      oracle_temperature: 0.20
+      listwise_weight: 0.50
+      top1_ce_weight: 0.30
+      pairwise_weight: 0.20
+    reranker:
+      enabled: true
+      hidden_dim: 256
+      path_embedding_dim: 64
+      dropout: 0.10
+      topk: 5
+      regression_weight: 0.50
+      ranking_weight: 0.50
+
+training:
+  epochs_direct: 30
+  epochs_operator_warmup: 10
+  epochs_supervised: 16
+  epochs_policy_warmup: 10
+  epochs_grpo: 12
+
+  strong_direct_init_checkpoint: auto
+  require_strong_direct_init: true
+  lr_pairwise: 3.0e-4
+  lr_pool: 3.0e-4
+  lr_direct_head: 2.0e-5
+  lr_ehr_last_layers: 1.0e-5
+  lr_reranker: 5.0e-5
+  lr_policy: 5.0e-5
+  lr_residual_finetune: 1.0e-6
+
+  direct_phase:
+    freeze_base_epochs: 5
+    ehr_last_layers: 1
+
+  oracle_candidates: 24
+  policy_warmup_candidates: 24
+  oracle_loss_weight: 0.60
+
+routing:
+  num_candidates: 24
+  policy_topk: 5
+  oracle_temperature: 0.20
+  listwise_weight: 0.50
+  top1_ce_weight: 0.30
+  pairwise_weight: 0.20
+
+reranker:
+  enabled: true
+  hidden_dim: 256
+  dropout: 0.10
+  topk: 5
+  regression_weight: 0.50
+  ranking_weight: 0.50
+
+grpo:
+  enabled: true
+  group_size: 8
+  grpo_epochs_per_batch: 1
+  clip_eps: 0.10
+  entropy_weight: 0.001
+  lr_policy: 3.0e-6
+  kl_anchor_weight: 0.05
+  update_residual: false
+
+reward:
+  bce_gain: 0.40
+  auroc_proxy_gain: 0.25
+  pr_proxy_gain: 0.25
+  reranker_consistency: 0.10
+  length: 0.0001
+
+selection:
+  tolerance_auroc: 0.001
+  tolerance_auprc: 0.002
+  target_delta_auroc: 0.003
+  target_delta_auprc: 0.005
+  reason_thresholds: [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+
+ensemble:
+  enabled: false
+
+multi_seed:
+  seeds: [13, 42, 2026]
+  development_seed: 42
