@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dummy_data/
+dummy_outputs/
+dummy_strong_data/
+strong_residual_outputs/
+strong_legacy_outputs/

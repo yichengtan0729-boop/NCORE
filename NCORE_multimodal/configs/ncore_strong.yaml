@@ -1,0 +1,91 @@
+paths:
+  output_root: ./strong_legacy_outputs
+  manifest: ./dummy_strong_data/manifest.csv
+  report_model_name_or_path: ''
+
+seed: 7
+device: cuda
+
+experiment:
+  name: ncore_strong
+  task_names: [vent24, mortality]
+  primary_metric: auprc_vent24
+
+model:
+  num_concepts: 16
+  concept_dim: 128
+  hidden_dim: 256
+  max_steps: 3
+  operator_rho: 0.98
+  operator_eta: 0.05
+  dropout: 0.1
+  modalities: [cxr, ecg, ehr]
+  encoders:
+    cxr:
+      backend: precomputed
+      input_dim: 512
+      output_dim: 512
+      freeze: true
+    ecg:
+      backend: precomputed
+      input_dim: 768
+      output_dim: 768
+      freeze: true
+    ehr:
+      backend: native_transformer
+      input_dim: 76
+      hidden_dim: 128
+      layers: 1
+      num_heads: 4
+      dropout: 0.1
+      freeze: false
+
+training:
+  batch_size: 16
+  num_workers: 0
+  epochs_supervised: 1
+  epochs_policy_warmup: 1
+  epochs_grpo: 1
+  lr: 1.0e-4
+  policy_lr: 5.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+  freeze_encoders_during_grpo: true
+  policy_warmup_candidates: 8
+  operator_sparse_weight: 0.0
+  operator_diversity_weight: 0.0
+  operator_stability_weight: 0.0
+
+rl:
+  group_size: 4
+  grpo_epochs_per_batch: 1
+  clip_eps: 0.2
+  entropy_weight: 0.005
+  reward:
+    pred: 1.0
+    order: 0.25
+    evidence: 0.10
+    faithfulness: 0.10
+    length: 0.05
+  faithfulness_probability: 0.25
+
+data:
+  format: csv
+  ehr_max_len: 48
+  labels:
+    vent24:
+      column: y_vent24
+      mask_column: mask_vent24
+    mortality:
+      column: y_mortality
+      mask_column: mask_mortality
+  modality_fields:
+    cxr:
+      kind: vector
+      column: cxr_embedding_path
+    ecg:
+      kind: vector
+      column: ecg_embedding_path
+    ehr:
+      kind: sequence
+      column: ehr_path

@@ -1,0 +1,23 @@
+PROJECT_ROOT: /workspace/scratch/0c2be1821183/work/NCORE_multimodal
+
+ADDED
+NCORE_V2_FILE_CHANGES.txt
+configs/ncore_strong_residual_v2.yaml
+configs/ncore_strong_residual_v2_mortality.yaml
+ncore/checkpointing.py
+ncore/losses.py
+ncore/models/v2.py
+tests/test_v2_checkpointing.py
+tests/test_v2_losses.py
+tests/test_v2_model.py
+
+MODIFIED
+evaluate.py
+ncore/config.py
+ncore/models/model.py
+ncore/models/policy.py
+ncore/training.py
+train.py
+
+DELETED
+(none)

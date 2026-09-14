@@ -1,0 +1,51 @@
+include_paths: configs/ncore_strong_residual.yaml
+
+experiment:
+  name: ncore_strong_residual_v2
+
+model:
+  direct_fusion:
+    mode: residual_attention
+    attention:
+      enabled: true
+      num_layers: 1
+      num_heads: 4
+      ff_dim: 512
+      dropout: 0.1
+      residual_gate_init: 0.10
+
+  operator:
+    force_identity_operator: false
+
+  residual:
+    enabled: true
+    mode: direct_aware
+    residual_dim: 256
+    hidden_dim: 256
+    dropout: 0.1
+    gate_mode: patient_specific
+    gate_hidden_dim: 128
+    gate_dropout: 0.1
+    alpha_max: 0.35
+    alpha_init: 0.08
+
+  policy:
+    include_direct_uncertainty: true
+
+training:
+  lr_ncore: 1.0e-3
+  init_checkpoint: ''
+  operator_warmup:
+    fixed_alpha: 0.15
+  loss:
+    hard_case_gamma: 1.0
+    hard_case_clip: 2.0
+    noharm_weight: 0.30
+    ranking_weight: 0.10
+    ranking_max_pairs: 1024
+
+# Ablations use the same switches: attention.enabled, residual.enabled,
+# residual.gate_mode, all loss weights, operator.force_identity_operator,
+# and this flag (false evaluates best_supervised.pt without an RL update).
+grpo:
+  enabled: true

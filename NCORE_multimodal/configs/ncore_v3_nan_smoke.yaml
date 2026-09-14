@@ -1,0 +1,11 @@
+include_paths: configs/ncore_strong_residual_v3_mortality.yaml
+
+experiment:
+  name: ncore_v3_nan_smoke
+
+training:
+  epochs_direct: 1
+  epochs_operator_warmup: 2
+  epochs_supervised: 1
+  epochs_policy_warmup: 1
+  epochs_grpo: 1

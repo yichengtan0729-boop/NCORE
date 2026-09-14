@@ -1,0 +1,159 @@
+include_paths: configs/ncore_strong_residual_v3_mortality.yaml
+
+seed: 42
+
+experiment:
+  name: ncore_performance_v5
+  formal_v5: true
+  seed_subdirectory: true
+
+task:
+  name: mortality
+
+model:
+  direct_fusion:
+    attention:
+      enabled: false
+
+  performance_v5:
+    enabled: true
+    reason_threshold: 0.50
+    pairwise:
+      dim: 256
+      rank_dim: 64
+      hidden_dim: 256
+      dropout: 0.10
+      gate_init: 0.05
+      gate_max: 0.30
+    pooling:
+      hidden_dim: 256
+      score_hidden_dim: 128
+      dropout: 0.10
+      gate_init: 0.03
+      gate_max: 0.20
+    bounded_correction:
+      selected_c: 0.35
+      candidates: [0.20, 0.35, 0.50]
+    utility:
+      momentum: 0.95
+    reason_gate:
+      hidden_dim: 128
+      dropout: 0.10
+
+training:
+  epochs_direct: 30
+  epochs_operator_warmup: 10
+  epochs_supervised: 16
+  epochs_policy_warmup: 10
+  epochs_grpo: 12
+
+  lr_pairwise: 3.0e-4
+  lr_pool: 3.0e-4
+  lr_direct_head: 2.0e-5
+  lr_ehr_last_layers: 1.0e-5
+  lr_reason_gate: 5.0e-5
+  lr_policy: 5.0e-5
+  lr_ncore: 1.0e-4
+  lr_ncore_grpo: 2.0e-5
+  lr_direct_grpo: 0.0
+
+  direct_phase:
+    freeze_base_epochs: 5
+    ehr_last_layers: 2
+
+  direct_loss:
+    auc_weight: 0.20
+    pr_weight: 0.15
+    hardpair_weight: 0.10
+    margin_auc: 0.50
+    margin_pr: 0.75
+    top_fraction: 0.25
+    hard_fraction: 0.25
+    positive_rank_weight: 2.0
+    max_pairs: 1024
+
+  positive_aware_sampler:
+    enabled: true
+    min_positive_per_batch: 4
+    positive_fraction_target: 0.20
+
+  modality_dropout:
+    enabled: true
+    probability: 0.10
+    per_modality:
+      cxr: 0.08
+      ecg: 0.08
+      ehr: 0.05
+
+  operator_warmup:
+    fixed_alpha: 0.15
+
+  loss:
+    noharm_weight: 0.10
+    noharm_detach_alpha: true
+    auc_rank_weight: 0.20
+    pr_rank_weight: 0.20
+    ranking_weight: 0.0
+    utility_rank_weight: 0.10
+    gate_supervision_weight: 0.35
+    margin_auc: 0.50
+    margin_pr: 0.75
+    ranking_max_pairs: 1024
+    delta_l2_weight: 0.01
+    alpha_probe: 0.15
+    hard_case_gamma: 0.0
+
+  oracle_candidates: 12
+  oracle_loss_weight: 0.60
+
+  policy_warmup:
+    utility_margin: 0.0
+    focal_gamma: 1.5
+    entropy_weight: 0.005
+    entropy_epochs: 10
+
+  ema:
+    enabled: true
+    decay: 0.999
+  swa:
+    enabled: true
+    last_epochs: 8
+
+  freeze_encoders_during_grpo: true
+  grpo_supervised_anchor: 0.0
+
+early_stopping:
+  enabled: false
+
+selection:
+  tolerance_auroc: 0.001
+  tolerance_auprc: 0.002
+  reason_thresholds: [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+  ensemble_weights:
+    - [0.3333333333, 0.3333333333, 0.3333333333]
+    - [0.5, 0.3, 0.2]
+    - [0.6, 0.2, 0.2]
+    - [0.4, 0.4, 0.2]
+
+grpo:
+  enabled: true
+  group_size: 8
+  grpo_epochs_per_batch: 1
+  clip_eps: 0.2
+  entropy_weight: 0.005
+  residual_refinement: false
+
+reward:
+  bce_gain: 0.45
+  auroc_proxy_gain: 0.30
+  pr_proxy_gain: 0.20
+  hard_case_bonus: 0.05
+  length: 0.0001
+
+calibration:
+  temperature_scaling: true
+  independent_final_temperature: true
+
+multi_seed:
+  seeds: [13, 42, 2026]
+

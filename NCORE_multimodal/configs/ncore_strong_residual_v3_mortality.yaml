@@ -1,0 +1,4 @@
+include_paths: configs/ncore_strong_residual_v3.yaml
+
+task:
+  name: mortality

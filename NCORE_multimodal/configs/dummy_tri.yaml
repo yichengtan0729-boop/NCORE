@@ -1,0 +1,56 @@
+paths:
+  output_root: ./dummy_outputs
+  manifest: ./dummy_data/manifest.csv
+  report_model_name_or_path: ''
+seed: 7
+device: cpu
+experiment:
+  name: dummy_tri
+  task_names: [vent24, mortality]
+  primary_metric: auprc_vent24
+model:
+  num_concepts: 6
+  concept_dim: 16
+  hidden_dim: 32
+  max_steps: 3
+  operator_rho: 0.98
+  operator_eta: 0.05
+  dropout: 0.0
+  modalities: [image, report, ehr]
+  encoders:
+    image: {backend: precomputed, input_dim: 64, output_dim: 64}
+    report: {backend: precomputed, input_dim: 48, output_dim: 48}
+    ehr: {backend: precomputed, input_dim: 32, output_dim: 32}
+training:
+  batch_size: 8
+  num_workers: 0
+  epochs_supervised: 1
+  epochs_policy_warmup: 1
+  epochs_grpo: 1
+  lr: 0.001
+  policy_lr: 0.0005
+  weight_decay: 0.0
+  grad_clip: 5.0
+  amp: false
+  freeze_encoders_during_grpo: false
+  supervised_route: round_robin
+  policy_warmup_candidates: 2
+  operator_sparse_weight: 0.0
+  operator_diversity_weight: 0.0
+  operator_stability_weight: 0.0
+rl:
+  group_size: 2
+  grpo_epochs_per_batch: 1
+  clip_eps: 0.2
+  entropy_weight: 0.001
+  reward: {pred: 1.0, order: 0.1, evidence: 0.05, faithfulness: 0.0, length: 0.02}
+  faithfulness_probability: 0.0
+data:
+  format: csv
+  labels:
+    vent24: {column: y_vent24, mask_column: mask_vent24}
+    mortality: {column: y_mortality, mask_column: mask_mortality}
+  modality_fields:
+    image: {kind: vector, column: image_path}
+    report: {kind: vector, column: report_embedding_path}
+    ehr: {kind: vector, column: ehr_path}

@@ -1,0 +1,120 @@
+paths:
+  output_root: ./strong_residual_outputs
+  manifest: ./dummy_strong_data/manifest.csv
+  report_model_name_or_path: ''
+
+seed: 7
+device: cuda
+
+experiment:
+  name: ncore_strong_residual
+
+task:
+  name: vent24
+
+model:
+  modalities: [cxr, ecg, ehr]
+  hidden_dim: 256
+  dropout: 0.1
+  operator_eta: 0.05
+
+  concept:
+    num_concepts: 8
+    concept_dim: 128
+
+  encoders:
+    cxr:
+      backend: precomputed
+      input_dim: 512
+      output_dim: 512
+      freeze: true
+    ecg:
+      backend: precomputed
+      input_dim: 768
+      output_dim: 768
+      freeze: true
+    ehr:
+      backend: native_transformer
+      input_dim: 76
+      hidden_dim: 128
+      layers: 1
+      num_heads: 4
+      dropout: 0.1
+      freeze: false
+
+  direct_fusion:
+    enabled: true
+    fusion_dim: 256
+    hidden_dim: 256
+    dropout: 0.2
+
+  operator:
+    identity_mix: true
+    identity_mix_init: 0.10
+    state_residual_gate_init: 0.10
+    rho: 0.98
+
+  residual:
+    operator_gate_init: 0.05
+
+  policy:
+    max_steps: 2
+
+training:
+  batch_size: 16
+  num_workers: 0
+  epochs_direct: 1
+  epochs_operator_warmup: 1
+  epochs_supervised: 1
+  epochs_policy_warmup: 1
+  epochs_grpo: 1
+  lr_direct: 1.0e-5
+  lr_ehr: 5.0e-5
+  lr_ncore: 1.0e-4
+  lr_policy: 1.0e-4
+  lr_ncore_grpo: 2.0e-5
+  lr_direct_grpo: 0.0
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+  freeze_encoders_during_grpo: true
+  policy_warmup_candidates: 8
+  operator_delta_l2: 0.1
+  grpo_supervised_anchor: 0.25
+  operator_sparse_weight: 0.0
+  operator_diversity_weight: 0.0
+  operator_stability_weight: 0.0
+
+reward:
+  prediction_delta: 1.0
+  order: 0.05
+  evidence: 0.0
+  faithfulness: 0.0
+  length: 0.01
+
+grpo:
+  group_size: 8
+  grpo_epochs_per_batch: 1
+  clip_eps: 0.2
+  entropy_weight: 0.005
+  faithfulness_probability: 0.0
+
+data:
+  format: csv
+  ehr_max_len: 48
+  labels:
+    vent24:
+      column: y_vent24
+      mask_column: mask_vent24
+    mortality:
+      column: y_mortality
+      mask_column: mask_mortality
+  modality_fields:
+    cxr:
+      kind: vector
+      column: cxr_embedding_path
+    ecg:
+      kind: vector
+      column: ecg_embedding_path
+    ehr:
+      kind: sequence
+      column: ehr_path

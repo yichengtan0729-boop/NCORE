@@ -1,0 +1,96 @@
+include_paths: configs/ncore_strong_residual_v2.yaml
+
+experiment:
+  name: ncore_strong_residual_v3
+
+model:
+  direct_fusion:
+    attention:
+      enabled: false
+
+  residual:
+    mode: direct_aware
+    gate_mode: patient_specific
+    alpha_min: 0.03
+    alpha_init: 0.08
+    alpha_max: 0.20
+    include_logit_magnitude: true
+
+  policy:
+    include_direct_uncertainty: true
+    include_logit_magnitude: true
+
+training:
+  epochs_direct: 20
+  epochs_operator_warmup: 8
+  epochs_supervised: 12
+  epochs_policy_warmup: 6
+  epochs_grpo: 10
+  lr_ncore: 1.0e-3
+  operator_delta_l2: 0.02
+  grad_clip:
+    enabled: true
+    max_norm: 1.0
+  max_consecutive_nonfinite_batches: 3
+
+  operator_warmup:
+    fixed_alpha: 0.15
+
+  loss:
+    noharm_weight: 0.30
+    noharm_detach_alpha: true
+    ranking_weight: 0.20
+    ranking_max_pairs: 1024
+    utility_rank_weight: 0.10
+    gate_supervision_weight: 0.20
+    utility_temperature: 0.10
+    alpha_probe: 0.15
+    hard_case_gamma: 0.5
+    hard_case_clip: 1.5
+
+  gate:
+    alpha_anchor: 0.08
+    anchor_weight: 0.05
+    anchor_decay_epochs: 6
+
+  policy_warmup:
+    balance_stop_nonstop: true
+    target_nonstop_fraction: 0.50
+    utility_margin: 0.0
+    entropy_weight: 0.01
+    entropy_epochs: 3
+
+  ema:
+    enabled: true
+    decay: 0.999
+
+reward:
+  prediction_delta: 1.0
+  prediction_temperature: 0.01
+  order: 0.02
+  evidence: 0.0
+  faithfulness: 0.0
+  length: 0.0001
+
+grpo:
+  entropy_weight: 0.005
+
+calibration:
+  temperature_scaling: true
+
+evaluation:
+  rollout_during_operator_warmup: false
+
+numerics:
+  eps: 1.0e-6
+  operator_clip: 10.0
+  commutator_clip: 20.0
+  commutator_norm_clip: 20.0
+  delta_clip: 10.0
+  state_update_clip: 10.0
+
+debug:
+  finite_checks: true
+  finite_checks_raise: true
+  fail_fast_on_nonfinite: true
+  parameter_finite_check_interval: 100

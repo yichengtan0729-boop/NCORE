@@ -1,0 +1,19 @@
+include_paths: configs/ncore_performance_v5_mortality.yaml
+
+experiment:
+  name: ncore_performance_v5_smoke
+  formal_v5: false
+  seed_subdirectory: false
+
+training:
+  epochs_direct: 2
+  epochs_operator_warmup: 2
+  epochs_supervised: 2
+  epochs_policy_warmup: 2
+  epochs_grpo: 2
+
+  oracle_candidates: 12
+
+grpo:
+  group_size: 2
+

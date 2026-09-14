@@ -1,0 +1,101 @@
+include_paths: configs/paths.yaml
+
+seed: 7
+device: cuda
+
+experiment:
+  name: ncore_tri
+  task_names: [vent24, mortality]
+  primary_metric: auprc_vent24
+
+model:
+  num_concepts: 16
+  concept_dim: 128
+  hidden_dim: 256
+  max_steps: 3
+  operator_rho: 0.98
+  operator_eta: 0.05
+  dropout: 0.1
+  modalities: [image, report, ehr]
+
+  # Each encoder returns one vector [B, D].
+  encoders:
+    image:
+      backend: torchvision
+      architecture: densenet121
+      pretrained: false
+      freeze: false
+      output_dim: 1024
+    report:
+      # Use `hf_text` for raw text, or `precomputed` for .npy report embeddings.
+      backend: precomputed
+      input_dim: 768
+      output_dim: 768
+      freeze: true
+    ehr:
+      # native_lstm expects [T,F]
+      backend: native_lstm
+      input_dim: 76
+      hidden_dim: 128
+      output_dim: 128
+      freeze: false
+
+training:
+  batch_size: 16
+  num_workers: 4
+  epochs_supervised: 20
+  epochs_policy_warmup: 3
+  epochs_grpo: 10
+  lr: 0.0001
+  policy_lr: 0.00005
+  weight_decay: 0.0001
+  grad_clip: 5.0
+  amp: true
+  freeze_encoders_during_grpo: true
+
+  supervised_route: round_robin
+  policy_warmup_candidates: 8
+
+  concept_loss_weight: 0.1
+  operator_sparse_weight: 0.0001
+  operator_diversity_weight: 0.01
+  operator_stability_weight: 0.1
+
+rl:
+  group_size: 4
+  grpo_epochs_per_batch: 2
+  clip_eps: 0.2
+  entropy_weight: 0.005
+
+  reward:
+    pred: 1.0
+    order: 0.25
+    evidence: 0.10
+    faithfulness: 0.10
+    length: 0.05
+
+  faithfulness_probability: 0.25
+
+data:
+  format: csv
+  image_size: 224
+  ehr_max_len: 48
+  report_max_length: 256
+  labels:
+    vent24:
+      column: y_vent24
+      mask_column: mask_vent24
+    mortality:
+      column: y_mortality
+      mask_column: mask_mortality
+
+  modality_fields:
+    image:
+      kind: image
+      column: image_path
+    report:
+      kind: vector
+      column: report_embedding_path
+    ehr:
+      kind: sequence
+      column: ehr_path
