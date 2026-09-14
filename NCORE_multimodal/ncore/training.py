@@ -1413,6 +1413,8 @@ def train_direct(model, train_loader, val_loader, cfg, device, output_dir,
                 _save_checkpoint(output_dir / "best_direct.pt", model, optimizer, cfg, "direct", epoch, metrics, pos_weight, selected_variant=winner, **extra)
                 if v5:
                     _save_checkpoint(output_dir / "best_direct_v5.pt", model, optimizer, cfg, "direct", epoch, metrics, pos_weight, selected_variant=winner, **extra)
+                if _is_v6(model):
+                    _save_checkpoint(output_dir / "best_direct_v6.pt", model, optimizer, cfg, "direct", epoch, metrics, pos_weight, selected_variant=winner, **extra)
             _print_best_validation("direct", metrics, cfg, prefix="direct")
 
     best_path = output_dir / "best_direct.pt"
