@@ -569,7 +569,7 @@ def _anchor_metric(metrics, task_name, metric):
     return float("-inf")
 
 
-def discover_strong_direct_checkpoint(cfg, output_dir):
+def discover_strong_direct_checkpoint(cfg, output_dir, model=None):
     configured = cfg.get("training", {}).get("strong_direct_init_checkpoint")
     if configured and str(configured).lower() not in {"auto", "none"}:
         path = Path(configured).expanduser()
@@ -595,7 +595,7 @@ def discover_strong_direct_checkpoint(cfg, output_dir):
         return None
     task_name = cfg["experiment"]["task_names"][0]
     ranked = []
-    model_shapes = None
+    model_state = model.state_dict() if model is not None else None
     for path in candidates:
         try:
             state = _load_torch_checkpoint(path, "cpu")
@@ -607,6 +607,13 @@ def discover_strong_direct_checkpoint(cfg, output_dir):
                 for name in [raw_name.removeprefix("module.")]
                 if _strong_direct_prefix(name)
                 and torch.is_tensor(value)
+                and (
+                    model_state is None
+                    or (
+                        name in model_state
+                        and model_state[name].shape == value.shape
+                    )
+                )
             )
             ranked.append(
                 (
@@ -626,7 +633,9 @@ def initialize_strong_direct_anchor(
     model, val_loader, cfg, device, output_dir
 ):
     """Load only the known direct anchor and validate it before formal training."""
-    checkpoint_path = discover_strong_direct_checkpoint(cfg, output_dir)
+    checkpoint_path = discover_strong_direct_checkpoint(
+        cfg, output_dir, model=model
+    )
     required = bool(
         cfg.get("training", {}).get(
             "require_strong_direct_init", _is_v6(model)
