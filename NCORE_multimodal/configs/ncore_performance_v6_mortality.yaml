@@ -1,0 +1,8 @@
+include_paths: configs/ncore_performance_v6.yaml
+
+task:
+  name: mortality
+
+experiment:
+  name: ncore_performance_v6
+  formal_v6: true
