@@ -78,8 +78,12 @@ def load_config(path: str | Path) -> Dict[str, Any]:
 
 def validate_v5_training_plan(cfg: Dict[str, Any]):
     v5 = bool(cfg.get("model", {}).get("performance_v5", {}).get("enabled", False))
-    formal = bool(cfg.get("experiment", {}).get("formal_v5", False))
-    if not (v5 and formal):
+    v6 = bool(cfg.get("model", {}).get("performance_v6", {}).get("enabled", False))
+    formal = bool(
+        cfg.get("experiment", {}).get("formal_v5", False)
+        or cfg.get("experiment", {}).get("formal_v6", False)
+    )
+    if not ((v5 or v6) and formal):
         return []
     training = cfg.get("training", {})
     below = []
@@ -91,7 +95,7 @@ def validate_v5_training_plan(cfg: Dict[str, Any]):
         details = ", ".join(
             f"{name}={actual}<{minimum}" for name, actual, minimum in below
         )
-        warnings.warn(f"formal v5 mortality training plan is below minimum: {details}")
+        warnings.warn(f"formal NCORE training plan is below minimum: {details}")
     return below
 
 
