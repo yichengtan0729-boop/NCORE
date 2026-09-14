@@ -283,15 +283,148 @@ def reason_gate_loss(
     }
 
 
-def oracle_candidate_utility(bce_gain, rank_gain, pr_gain, eps=1e-6):
-    """Combine per-sample candidate gains after within-group normalization."""
-    values = []
-    for gain in [bce_gain, rank_gain, pr_gain]:
-        gain = torch.nan_to_num(gain.float())
-        mean = gain.mean(dim=-1, keepdim=True)
-        std = gain.std(dim=-1, keepdim=True, unbiased=False).clamp_min(eps)
-        values.append((gain - mean) / std)
-    return 0.50 * values[0] + 0.25 * values[1] + 0.25 * values[2]
+def patient_wise_utility_normalize(values, eps=1e-6):
+    """Normalize candidate utility within each patient, never across patients."""
+    values = torch.nan_to_num(values.float(), nan=0.0, posinf=10.0, neginf=-10.0)
+    mean = values.mean(dim=-1, keepdim=True)
+    std = values.std(dim=-1, keepdim=True, unbiased=False)
+    normalized = (values - mean) / (std + float(eps))
+    return torch.nan_to_num(normalized, nan=0.0, posinf=10.0, neginf=-10.0)
+
+
+def oracle_candidate_utility(
+    bce_gain,
+    rank_gain,
+    pr_gain,
+    eps=1e-6,
+    weights=(0.50, 0.25, 0.25),
+):
+    """Combine candidate gains after strictly patient-wise normalization."""
+    normalized = [
+        patient_wise_utility_normalize(gain, eps=eps)
+        for gain in [bce_gain, rank_gain, pr_gain]
+    ]
+    return sum(float(weight) * value for weight, value in zip(weights, normalized))
+
+
+def listwise_kl_loss(policy_scores, oracle_utility, temperature=0.20):
+    temperature = max(float(temperature), 1e-6)
+    utility = patient_wise_utility_normalize(oracle_utility).detach()
+    target = torch.softmax(utility / temperature, dim=-1)
+    log_target = torch.log(target.clamp_min(1e-8))
+    log_policy = torch.log_softmax(policy_scores.float(), dim=-1)
+    return (target * (log_target - log_policy)).sum(-1).mean()
+
+
+def path_pairwise_preference_loss(
+    policy_scores, oracle_utility, margin=0.20, max_pairs=256
+):
+    scores = policy_scores.float()
+    utility = oracle_utility.detach().float()
+    score_delta = scores.unsqueeze(2) - scores.unsqueeze(1)
+    utility_delta = utility.unsqueeze(2) - utility.unsqueeze(1)
+    preferred = utility_delta > 1e-8
+    losses = F.softplus(float(margin) - score_delta)[preferred]
+    if losses.numel() == 0:
+        return scores.sum() * 0.0
+    if max_pairs and losses.numel() > int(max_pairs):
+        losses = losses[: int(max_pairs)]
+    return losses.mean()
+
+
+def path_distillation_loss(
+    policy_scores,
+    oracle_utility,
+    *,
+    temperature=0.20,
+    listwise_weight=0.50,
+    top1_weight=0.30,
+    pairwise_weight=0.20,
+    margin=0.20,
+):
+    utility = patient_wise_utility_normalize(oracle_utility).detach()
+    target_index = utility.argmax(-1)
+    listwise = listwise_kl_loss(policy_scores, utility, temperature)
+    top1 = F.cross_entropy(policy_scores.float(), target_index)
+    pairwise = path_pairwise_preference_loss(
+        policy_scores, utility, margin=margin
+    )
+    total = (
+        float(listwise_weight) * listwise
+        + float(top1_weight) * top1
+        + float(pairwise_weight) * pairwise
+    )
+    return total, {"listwise": listwise, "top1_ce": top1, "pairwise": pairwise}
+
+
+def select_reranker_training_mask(
+    oracle_utility,
+    policy_scores,
+    positives=2,
+    hard_negatives=4,
+    easy_negatives=2,
+):
+    """Select 2 oracle positives, 4 policy-confident errors and 2 easy negatives."""
+    utility = oracle_utility.detach()
+    policy = policy_scores.detach()
+    batch, candidates = utility.shape
+    mask = torch.zeros_like(utility, dtype=torch.bool)
+    positive_count = min(int(positives), candidates)
+    for row in range(batch):
+        positive = utility[row].topk(positive_count).indices
+        mask[row, positive] = True
+        remaining = ~mask[row]
+        hard_pool = policy[row].masked_fill(~remaining, -torch.inf)
+        hard_count = min(int(hard_negatives), int(remaining.sum()))
+        if hard_count:
+            hard = hard_pool.topk(hard_count).indices
+            mask[row, hard] = True
+        remaining = ~mask[row]
+        easy_count = min(int(easy_negatives), int(remaining.sum()))
+        if easy_count:
+            easy = utility[row].masked_fill(~remaining, torch.inf).topk(
+                easy_count, largest=False
+            ).indices
+            mask[row, easy] = True
+    return mask
+
+
+def reranker_objective(
+    reranker_scores,
+    oracle_utility,
+    policy_scores,
+    *,
+    regression_weight=0.50,
+    ranking_weight=0.50,
+    margin=0.20,
+):
+    target = patient_wise_utility_normalize(oracle_utility).detach()
+    selected = select_reranker_training_mask(target, policy_scores)
+    regression = F.huber_loss(
+        reranker_scores[selected].float(), target[selected].float()
+    )
+    masked_scores = reranker_scores.masked_fill(~selected, -1e4)
+    masked_target = target.masked_fill(~selected, -1e4)
+    ranking = path_pairwise_preference_loss(
+        masked_scores, masked_target, margin=margin
+    )
+    total = (
+        float(regression_weight) * regression
+        + float(ranking_weight) * ranking
+    )
+    return total, {
+        "reranker_regression": regression,
+        "reranker_ranking": ranking,
+        "reranker_selected_fraction": selected.float().mean(),
+    }
+
+
+def categorical_policy_kl(current_logits, reference_logits):
+    """Exact categorical KL over matching rollout-step distributions."""
+    current_log = torch.log_softmax(current_logits.float(), dim=-1)
+    reference_log = torch.log_softmax(reference_logits.detach().float(), dim=-1)
+    current_probability = current_log.exp()
+    return (current_probability * (current_log - reference_log)).sum(-1).mean()
 
 
 def hard_case_weights(direct_per_sample_loss, gamma=1.0, clip=2.0,
