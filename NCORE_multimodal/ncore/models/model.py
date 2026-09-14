@@ -26,6 +26,7 @@ from .v5 import (
     RunningUtilityNormalizer,
     bounded_correction,
 )
+from .v6 import CandidateReranker, select_candidate_actions
 from ncore.numerics import assert_finite_tensor
 
 
@@ -45,7 +46,9 @@ class NCORE(nn.Module):
         operator_cfg = model_cfg.get("operator", {})
         residual_cfg = model_cfg.get("residual", {})
         performance_cfg = model_cfg.get("performance_v5", {})
-        self.performance_v5 = bool(performance_cfg.get("enabled", False))
+        self.performance_v6_cfg = dict(model_cfg.get("performance_v6", {}))
+        self.performance_v6 = bool(self.performance_v6_cfg.get("enabled", False))
+        self.performance_v5 = bool(performance_cfg.get("enabled", False)) or self.performance_v6
         self.numerics_cfg = dict(cfg.get("numerics", {}))
         self.debug_cfg = dict(cfg.get("debug", {}))
         self.numerics_eps = float(self.numerics_cfg.get("eps", 1e-6))
@@ -146,6 +149,11 @@ class NCORE(nn.Module):
             ),
             persistent=self.performance_v5,
         )
+        self.register_buffer(
+            "use_strong_direct_fallback",
+            torch.tensor(False),
+            persistent=self.performance_v6,
+        )
 
         eps_init = float(operator_cfg.get("identity_mix_init", 0.10))
         self.operator_eps_logits = nn.ParameterDict(
@@ -167,6 +175,7 @@ class NCORE(nn.Module):
         self.pooling_residual = None
         self.reason_gate = None
         self.utility_normalizer = None
+        self.reranker = None
         if self.direct_enabled:
             fusion_dim = int(direct_cfg.get("fusion_dim", 256))
             hidden_dim = int(direct_cfg.get("hidden_dim", fusion_dim))
@@ -232,6 +241,17 @@ class NCORE(nn.Module):
                     ),
                     eps=self.numerics_eps,
                 )
+                reranker_cfg = self.performance_v6_cfg.get("reranker", {})
+                if self.performance_v6 and bool(reranker_cfg.get("enabled", True)):
+                    self.reranker = CandidateReranker(
+                        direct_dim=hidden_dim,
+                        operator_dim=self.D,
+                        num_tasks=self.num_tasks,
+                        num_modalities=self.M,
+                        num_concepts=self.K,
+                        max_steps=self.max_steps,
+                        cfg=reranker_cfg,
+                    )
             nn.init.zeros_(self.outcome_head[-1].weight)
             nn.init.zeros_(self.outcome_head[-1].bias)
         else:
@@ -464,6 +484,9 @@ class NCORE(nn.Module):
             )
             return {
                 "direct_base_logits": zeros,
+                "strong_direct_logits": zeros,
+                "pairwise_delta": zeros,
+                "pool_delta": zeros,
                 "direct_logits": zeros,
                 "direct_base_hidden": None,
                 "direct_hidden": None,
@@ -496,32 +519,40 @@ class NCORE(nn.Module):
                     projected, modality_mask, base_hidden
                 )
             )
-        direct_logits = self.direct_head(direct_hidden)
-        pair_delta = torch.zeros_like(direct_logits)
-        pool_delta = torch.zeros_like(direct_logits)
-        pair_logits = direct_logits
-        pool_logits = direct_logits
-        pair_gate = direct_logits.new_tensor(0.0)
-        pool_gate = direct_logits.new_tensor(0.0)
-        modality_weights = direct_logits.new_zeros(modality_mask.shape)
-        if self.pairwise_residual is not None:
-            gated_pair, pair_delta, adapted, pair_masks = self.pairwise_residual(
+        strong_direct_logits = self.direct_head(direct_hidden)
+        pair_delta = torch.zeros_like(strong_direct_logits)
+        pool_delta = torch.zeros_like(strong_direct_logits)
+        pair_gate = strong_direct_logits.new_tensor(0.0)
+        pool_gate = strong_direct_logits.new_tensor(0.0)
+        pairwise_delta = torch.zeros_like(strong_direct_logits)
+        pooling_delta = torch.zeros_like(strong_direct_logits)
+        modality_weights = strong_direct_logits.new_zeros(modality_mask.shape)
+        residuals_enabled = not bool(self.use_strong_direct_fallback.item())
+        if self.pairwise_residual is not None and residuals_enabled:
+            _, pair_delta, adapted, pair_masks = self.pairwise_residual(
                 encoded["h"], modality_mask
             )
-            base_probability, _, _ = self.direct_uncertainty_features(base_logits)
-            gated_pool, pool_delta, modality_weights = self.pooling_residual(
-                adapted, modality_mask, base_probability
+            strong_probability, _, _ = self.direct_uncertainty_features(
+                strong_direct_logits
             )
-            pair_logits = base_logits + gated_pair
-            pool_logits = base_logits + gated_pool
-            direct_logits = base_logits + gated_pair + gated_pool
+            _, pool_delta, modality_weights = self.pooling_residual(
+                adapted, modality_mask, strong_probability
+            )
             pair_gate = self.pairwise_residual.gate.value()
             pool_gate = self.pooling_residual.gate.value()
+            pairwise_delta = pair_gate * pair_delta
+            pooling_delta = pool_gate * pool_delta
             self._check("direct_pair_delta", pair_delta)
             self._check("direct_pool_delta", pool_delta)
             self._check("direct_modality_weights", modality_weights)
+        pair_logits = strong_direct_logits + pairwise_delta
+        pool_logits = strong_direct_logits + pooling_delta
+        direct_logits = strong_direct_logits + pairwise_delta + pooling_delta
         return {
             "direct_base_logits": base_logits,
+            "strong_direct_logits": strong_direct_logits,
+            "pairwise_delta": pair_delta,
+            "pool_delta": pool_delta,
             "direct_logits": direct_logits,
             "direct_base_hidden": base_hidden,
             "direct_hidden": direct_hidden,
@@ -538,6 +569,10 @@ class NCORE(nn.Module):
 
     def direct_logits(self, encoded, modality_mask):
         return self.direct_outputs(encoded, modality_mask)["direct_logits"]
+
+    def set_strong_direct_fallback(self, enabled: bool) -> None:
+        self.use_strong_direct_fallback.fill_(bool(enabled))
+
 
     def _commutator_features(self, operators, state):
         features, stats = commutator_features(
@@ -834,7 +869,10 @@ class NCORE(nn.Module):
         )
         return logits
 
-    def _policy_inputs(self, state, encoded, operators, modality_mask, prev_action, step):
+    def _policy_inputs(
+        self, state, encoded, operators, modality_mask, prev_action, step,
+        policy_module=None,
+    ):
         state_pool = state.mean(1)
         self._check("operator_state", state)
         context = self._context(encoded, modality_mask)
@@ -855,7 +893,8 @@ class NCORE(nn.Module):
             extra_features = self._policy_extra_features(
                 outputs, operators, state, modality_mask
             )
-        details = self.policy(
+        active_policy = policy_module if policy_module is not None else self.policy
+        details = active_policy(
             state_pool,
             context,
             commutators,
@@ -970,7 +1009,142 @@ class NCORE(nn.Module):
         outputs.update(self._last_policy_diagnostics)
         return outputs
 
+    def score_candidate_rollout(self, rollout, modality_mask):
+        if self.reranker is None:
+            raise RuntimeError("Candidate reranker is not enabled")
+        direct_probability, entropy, _ = self.direct_uncertainty_features(
+            rollout["direct_logits"].detach()
+        )
+        comm_mean, comm_max = self._commutator_summary(
+            rollout["operators"], rollout["state"].detach(), modality_mask
+        )
+        final_probability = torch.sigmoid(rollout["logits"].detach())
+        return self.reranker(
+            rollout["direct_hidden"].detach(),
+            direct_probability.detach(),
+            entropy.detach(),
+            modality_mask,
+            rollout["actions"],
+            rollout["operator_hidden"].detach(),
+            torch.cat([comm_mean, comm_max], dim=-1).detach(),
+            rollout["bounded_correction"].detach().abs(),
+            (final_probability - direct_probability).detach(),
+            rollout["length"].detach(),
+        )
+
+    def generate_policy_topk_paths(
+        self, batch, encoded=None, operators=None, topk=None
+    ):
+        encoded = encoded or self.encode(batch)
+        operators = operators or self.build_operators(
+            encoded, batch["modality_mask"]
+        )
+        modality_mask = batch["modality_mask"]
+        batch_size = modality_mask.size(0)
+        requested = int(
+            topk
+            if topk is not None
+            else self.performance_v6_cfg.get("routing", {}).get("policy_topk", 5)
+        )
+        requested = max(1, min(requested, self.policy.num_actions))
+        paths = []
+        for offset in range(requested):
+            actions = torch.full(
+                (batch_size, self.max_steps),
+                self.stop_idx,
+                dtype=torch.long,
+                device=modality_mask.device,
+            )
+            state = self.initial(batch_size, modality_mask.device)
+            previous = torch.full(
+                (batch_size,),
+                self.policy.num_actions,
+                dtype=torch.long,
+                device=modality_mask.device,
+            )
+            for step in range(self.max_steps):
+                logits = self._policy_inputs(
+                    state,
+                    encoded,
+                    operators,
+                    modality_mask,
+                    previous,
+                    step,
+                )
+                rank = min(offset, logits.size(1) - 1)
+                action = logits.topk(rank + 1, dim=1).indices[:, rank]
+                actions[:, step] = action
+                state, _ = self.apply_action(
+                    state, encoded, operators, action
+                )
+                previous = action
+            paths.append(actions)
+        return paths
+
+    def reranked_rollout(self, batch, encoded=None, operators=None):
+        if self.reranker is None:
+            raise RuntimeError("Candidate reranker is not enabled")
+        encoded = encoded or self.encode(batch)
+        operators = operators or self.build_operators(
+            encoded, batch["modality_mask"]
+        )
+        batch_size = batch["modality_mask"].size(0)
+        initial_state = self.initial(batch_size, batch["modality_mask"].device)
+        direct = self.direct_outputs(encoded, batch["modality_mask"])
+        initial_outputs = self.prediction_outputs(
+            initial_state,
+            encoded,
+            batch["modality_mask"],
+            operators=operators,
+            direct=direct,
+            reason_mask=torch.ones(
+                batch_size, device=batch["modality_mask"].device
+            ),
+        )
+        reason_probability = initial_outputs["reason_probability"].squeeze(-1)
+        reason_mask = reason_probability >= self.reason_threshold
+        paths = self.generate_policy_topk_paths(
+            batch, encoded=encoded, operators=operators
+        )
+        candidate_rollouts, reranker_scores, policy_scores = [], [], []
+        for actions in paths:
+            candidate = self.rollout_actions(
+                batch, actions, encoded=encoded, operators=operators
+            )
+            candidate_rollouts.append(candidate)
+            reranker_scores.append(
+                self.score_candidate_rollout(candidate, batch["modality_mask"])
+            )
+            policy_scores.append(candidate["path_logprob"])
+        reranker_scores = torch.stack(reranker_scores, dim=1)
+        policy_scores = torch.stack(policy_scores, dim=1)
+        selected_index = reranker_scores.argmax(1)
+        candidate_actions = torch.stack(paths, dim=1)
+        selected_actions = select_candidate_actions(
+            candidate_actions, selected_index
+        )
+        stop_actions = torch.full_like(selected_actions, self.stop_idx)
+        selected_actions = torch.where(
+            reason_mask[:, None], selected_actions, stop_actions
+        )
+        result = self.rollout_actions(
+            batch, selected_actions, encoded=encoded, operators=operators
+        )
+        result["reason_probability"] = reason_probability
+        result["policy_topk_actions"] = candidate_actions
+        result["candidate_policy_scores"] = policy_scores
+        result["reranker_scores"] = reranker_scores
+        result["reranker_selected_index"] = selected_index
+        result["reranker_score"] = reranker_scores.gather(
+            1, selected_index[:, None]
+        ).squeeze(1)
+        return result
+
     def sample_rollout(self, batch, encoded=None, operators=None, deterministic=False):
+        if deterministic and self.performance_v6 and self.reranker is not None:
+            return self.reranked_rollout(
+                batch, encoded=encoded, operators=operators
+            )
         if encoded is None:
             encoded = self.encode(batch)
         if operators is None:
@@ -1038,9 +1212,15 @@ class NCORE(nn.Module):
         if self.performance_v5:
             result["path_logprob"] = path_logprob
             result["reason_logprob"] = reason_logprob
+        if self.performance_v6 and self.reranker is not None:
+            result["reranker_score"] = self.score_candidate_rollout(
+                result, batch["modality_mask"]
+            )
         return result
 
-    def rollout_actions(self, batch, actions, encoded=None, operators=None):
+    def rollout_actions(
+        self, batch, actions, encoded=None, operators=None, policy_module=None
+    ):
         if encoded is None:
             encoded = self.encode(batch)
         if operators is None:
@@ -1052,7 +1232,7 @@ class NCORE(nn.Module):
             (batch_size,), self.policy.num_actions, dtype=torch.long, device=device
         )
         done = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        logps, entropies, evidence_steps = [], [], []
+        logps, entropies, evidence_steps, policy_logits_steps = [], [], [], []
         reason_mask = actions[:, 0].ne(self.stop_idx) if self.performance_v5 else None
         reason_probability = None
         if self.performance_v5:
@@ -1071,9 +1251,16 @@ class NCORE(nn.Module):
         for step in range(actions.size(1)):
             action = actions[:, step]
             policy_logits = self._policy_inputs(
-                state, encoded, operators, batch["modality_mask"], previous, step
+                state,
+                encoded,
+                operators,
+                batch["modality_mask"],
+                previous,
+                step,
+                policy_module=policy_module,
             )
             self._check("policy_logits_before_categorical", policy_logits, force=True)
+            policy_logits_steps.append(policy_logits)
             distribution = torch.distributions.Categorical(logits=policy_logits)
             safe_action = action.clamp_max(self.policy.num_actions - 1)
             logprob, entropy = distribution.log_prob(safe_action), distribution.entropy()
@@ -1095,6 +1282,7 @@ class NCORE(nn.Module):
             state, encoded, batch["modality_mask"], actions, logps, entropies,
             evidence_steps, operators, reason_mask, reason_probability
         )
+        result["policy_logits_steps"] = torch.stack(policy_logits_steps, dim=1)
         if self.performance_v5:
             result["path_logprob"] = path_logprob
             result["reason_logprob"] = reason_logprob
