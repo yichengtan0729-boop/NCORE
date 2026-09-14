@@ -63,14 +63,41 @@ def reward_components(model, batch, rollout, cfg, pos_weight=None,
             raw_prediction_delta
         )
         length = rollout["length"]
-        length_penalty = 0.0001 * length
-        total = (
-            float(reward_cfg.get("bce_gain", 0.45)) * raw_prediction_delta
-            + float(reward_cfg.get("auroc_proxy_gain", 0.30)) * auc_proxy_gain
-            + float(reward_cfg.get("pr_proxy_gain", 0.20)) * pr_proxy_gain
-            + float(reward_cfg.get("hard_case_bonus", 0.05)) * hard_case_bonus
-            - length_penalty
+        length_penalty = float(reward_cfg.get("length", 0.0001)) * length
+        is_v6 = bool(
+            cfg.get("model", {}).get("performance_v6", {}).get("enabled", False)
         )
+        if is_v6:
+            utility_target = (
+                0.40 * raw_prediction_delta
+                + 0.25 * auc_proxy_gain
+                + 0.25 * pr_proxy_gain
+            )
+            if "reranker_score" in rollout:
+                reranker_consistency = -torch.nn.functional.smooth_l1_loss(
+                    rollout["reranker_score"].float(),
+                    utility_target.detach().float(),
+                    reduction="none",
+                )
+            else:
+                reranker_consistency = torch.zeros_like(utility_target)
+            total = (
+                float(reward_cfg.get("bce_gain", 0.40)) * raw_prediction_delta
+                + float(reward_cfg.get("auroc_proxy_gain", 0.25)) * auc_proxy_gain
+                + float(reward_cfg.get("pr_proxy_gain", 0.25)) * pr_proxy_gain
+                + float(reward_cfg.get("reranker_consistency", 0.10))
+                * reranker_consistency
+                - length_penalty
+            )
+        else:
+            reranker_consistency = torch.zeros_like(raw_prediction_delta)
+            total = (
+                float(reward_cfg.get("bce_gain", 0.45)) * raw_prediction_delta
+                + float(reward_cfg.get("auroc_proxy_gain", 0.30)) * auc_proxy_gain
+                + float(reward_cfg.get("pr_proxy_gain", 0.20)) * pr_proxy_gain
+                + float(reward_cfg.get("hard_case_bonus", 0.05)) * hard_case_bonus
+                - length_penalty
+            )
         zeros = torch.zeros_like(total)
         return {
             "total": total,
@@ -81,6 +108,7 @@ def reward_components(model, batch, rollout, cfg, pos_weight=None,
             "auroc_proxy_gain": auc_proxy_gain,
             "pr_proxy_gain": pr_proxy_gain,
             "hard_case_bonus": hard_case_bonus,
+            "reranker_consistency": reranker_consistency,
             "order": zeros,
             "order_contribution": zeros,
             "evidence": rollout["evidence"],
